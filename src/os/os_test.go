@@ -2398,8 +2398,6 @@ func TestUserHomeDir(t *testing.T) {
 	if err != nil {
 		t.Skipf("UserHomeDir failed: %v", err)
 	}
-	// On Debian buildds, the user home dir does not exist.
-	t.Skip("UserHomeDir does not exist on Debian buildds.")
 	fi, err := Stat(dir)
 	if err != nil {
 		t.Fatal(err)
