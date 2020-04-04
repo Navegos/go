@@ -602,6 +602,20 @@ const (
 	OpAMD64CMPLconstload
 	OpAMD64CMPWconstload
 	OpAMD64CMPBconstload
+	OpAMD64CMPQloadidx8
+	OpAMD64CMPQloadidx1
+	OpAMD64CMPLloadidx4
+	OpAMD64CMPLloadidx1
+	OpAMD64CMPWloadidx2
+	OpAMD64CMPWloadidx1
+	OpAMD64CMPBloadidx1
+	OpAMD64CMPQconstloadidx8
+	OpAMD64CMPQconstloadidx1
+	OpAMD64CMPLconstloadidx4
+	OpAMD64CMPLconstloadidx1
+	OpAMD64CMPWconstloadidx2
+	OpAMD64CMPWconstloadidx1
+	OpAMD64CMPBconstloadidx1
 	OpAMD64UCOMISS
 	OpAMD64UCOMISD
 	OpAMD64BTL
@@ -871,6 +885,7 @@ const (
 	OpAMD64LoweredGetCallerSP
 	OpAMD64LoweredNilCheck
 	OpAMD64LoweredWB
+	OpAMD64LoweredHasCPUFeature
 	OpAMD64LoweredPanicBoundsA
 	OpAMD64LoweredPanicBoundsB
 	OpAMD64LoweredPanicBoundsC
@@ -1881,10 +1896,16 @@ const (
 	OpPPC64FlagEQ
 	OpPPC64FlagLT
 	OpPPC64FlagGT
+	OpPPC64FlagCarrySet
+	OpPPC64FlagCarryClear
 
 	OpRISCV64ADD
 	OpRISCV64ADDI
+	OpRISCV64ADDIW
+	OpRISCV64NEG
+	OpRISCV64NEGW
 	OpRISCV64SUB
+	OpRISCV64SUBW
 	OpRISCV64MUL
 	OpRISCV64MULW
 	OpRISCV64MULH
@@ -1913,6 +1934,10 @@ const (
 	OpRISCV64MOVHstore
 	OpRISCV64MOVWstore
 	OpRISCV64MOVDstore
+	OpRISCV64MOVBstorezero
+	OpRISCV64MOVHstorezero
+	OpRISCV64MOVWstorezero
+	OpRISCV64MOVDstorezero
 	OpRISCV64SLL
 	OpRISCV64SRA
 	OpRISCV64SRL
@@ -1925,6 +1950,7 @@ const (
 	OpRISCV64ORI
 	OpRISCV64AND
 	OpRISCV64ANDI
+	OpRISCV64NOT
 	OpRISCV64SEQZ
 	OpRISCV64SNEZ
 	OpRISCV64SLT
@@ -1937,6 +1963,18 @@ const (
 	OpRISCV64CALLinter
 	OpRISCV64LoweredZero
 	OpRISCV64LoweredMove
+	OpRISCV64LoweredAtomicLoad8
+	OpRISCV64LoweredAtomicLoad32
+	OpRISCV64LoweredAtomicLoad64
+	OpRISCV64LoweredAtomicStore8
+	OpRISCV64LoweredAtomicStore32
+	OpRISCV64LoweredAtomicStore64
+	OpRISCV64LoweredAtomicExchange32
+	OpRISCV64LoweredAtomicExchange64
+	OpRISCV64LoweredAtomicAdd32
+	OpRISCV64LoweredAtomicAdd64
+	OpRISCV64LoweredAtomicCas32
+	OpRISCV64LoweredAtomicCas64
 	OpRISCV64LoweredNilCheck
 	OpRISCV64LoweredGetClosurePtr
 	OpRISCV64LoweredGetCallerSP
@@ -2071,6 +2109,8 @@ const (
 	OpS390XCMPWUconst
 	OpS390XFCMPS
 	OpS390XFCMP
+	OpS390XLTDBR
+	OpS390XLTEBR
 	OpS390XSLD
 	OpS390XSLW
 	OpS390XSLDconst
@@ -2111,6 +2151,14 @@ const (
 	OpS390XCDFBRA
 	OpS390XCEGBRA
 	OpS390XCDGBRA
+	OpS390XCLFEBR
+	OpS390XCLFDBR
+	OpS390XCLGEBR
+	OpS390XCLGDBR
+	OpS390XCELFBR
+	OpS390XCDLFBR
+	OpS390XCELGBR
+	OpS390XCDLGBR
 	OpS390XLEDBR
 	OpS390XLDEBR
 	OpS390XMOVDaddr
@@ -2466,24 +2514,8 @@ const (
 	OpLeq64U
 	OpLeq32F
 	OpLeq64F
-	OpGreater8
-	OpGreater8U
-	OpGreater16
-	OpGreater16U
-	OpGreater32
-	OpGreater32U
-	OpGreater64
-	OpGreater64U
 	OpGreater32F
 	OpGreater64F
-	OpGeq8
-	OpGeq8U
-	OpGeq16
-	OpGeq16U
-	OpGeq32
-	OpGeq32U
-	OpGeq64
-	OpGeq64U
 	OpGeq32F
 	OpGeq64F
 	OpCondSelect
@@ -2565,6 +2597,7 @@ const (
 	OpMoveWB
 	OpZeroWB
 	OpWB
+	OpHasCPUFeature
 	OpPanicBounds
 	OpPanicExtend
 	OpClosureCall
@@ -2598,6 +2631,7 @@ const (
 	OpCvt64Fto64
 	OpCvt32Fto64F
 	OpCvt64Fto32F
+	OpCvtBoolToUint8
 	OpRound32F
 	OpRound64F
 	OpIsNonNil
@@ -2653,6 +2687,8 @@ const (
 	OpSignmask
 	OpZeromask
 	OpSlicemask
+	OpSpectreIndex
+	OpSpectreSliceIndex
 	OpCvt32Uto32F
 	OpCvt32Uto64F
 	OpCvt32Fto32U
@@ -4334,14 +4370,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "ADDLloadidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		resultInArg0:   true,
-		clobberFlags:   true,
-		faultOnNilArg1: true,
-		symEffect:      SymRead,
-		asm:            x86.AADDL,
+		name:         "ADDLloadidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		resultInArg0: true,
+		clobberFlags: true,
+		symEffect:    SymRead,
+		asm:          x86.AADDL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 239},   // AX CX DX BX BP SI DI
@@ -4354,14 +4389,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "SUBLloadidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		resultInArg0:   true,
-		clobberFlags:   true,
-		faultOnNilArg1: true,
-		symEffect:      SymRead,
-		asm:            x86.ASUBL,
+		name:         "SUBLloadidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		resultInArg0: true,
+		clobberFlags: true,
+		symEffect:    SymRead,
+		asm:          x86.ASUBL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 239},   // AX CX DX BX BP SI DI
@@ -4374,14 +4408,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MULLloadidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		resultInArg0:   true,
-		clobberFlags:   true,
-		faultOnNilArg1: true,
-		symEffect:      SymRead,
-		asm:            x86.AIMULL,
+		name:         "MULLloadidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		resultInArg0: true,
+		clobberFlags: true,
+		symEffect:    SymRead,
+		asm:          x86.AIMULL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 239},   // AX CX DX BX BP SI DI
@@ -4394,14 +4427,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "ANDLloadidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		resultInArg0:   true,
-		clobberFlags:   true,
-		faultOnNilArg1: true,
-		symEffect:      SymRead,
-		asm:            x86.AANDL,
+		name:         "ANDLloadidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		resultInArg0: true,
+		clobberFlags: true,
+		symEffect:    SymRead,
+		asm:          x86.AANDL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 239},   // AX CX DX BX BP SI DI
@@ -4414,14 +4446,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "ORLloadidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		resultInArg0:   true,
-		clobberFlags:   true,
-		faultOnNilArg1: true,
-		symEffect:      SymRead,
-		asm:            x86.AORL,
+		name:         "ORLloadidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		resultInArg0: true,
+		clobberFlags: true,
+		symEffect:    SymRead,
+		asm:          x86.AORL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 239},   // AX CX DX BX BP SI DI
@@ -4434,14 +4465,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "XORLloadidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		resultInArg0:   true,
-		clobberFlags:   true,
-		faultOnNilArg1: true,
-		symEffect:      SymRead,
-		asm:            x86.AXORL,
+		name:         "XORLloadidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		resultInArg0: true,
+		clobberFlags: true,
+		symEffect:    SymRead,
+		asm:          x86.AXORL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 239},   // AX CX DX BX BP SI DI
@@ -5188,13 +5218,12 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "ADDLmodifyidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		clobberFlags:   true,
-		faultOnNilArg0: true,
-		symEffect:      SymRead | SymWrite,
-		asm:            x86.AADDL,
+		name:         "ADDLmodifyidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		clobberFlags: true,
+		symEffect:    SymRead | SymWrite,
+		asm:          x86.AADDL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 255},   // AX CX DX BX SP BP SI DI
@@ -5204,13 +5233,12 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "SUBLmodifyidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		clobberFlags:   true,
-		faultOnNilArg0: true,
-		symEffect:      SymRead | SymWrite,
-		asm:            x86.ASUBL,
+		name:         "SUBLmodifyidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		clobberFlags: true,
+		symEffect:    SymRead | SymWrite,
+		asm:          x86.ASUBL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 255},   // AX CX DX BX SP BP SI DI
@@ -5220,13 +5248,12 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "ANDLmodifyidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		clobberFlags:   true,
-		faultOnNilArg0: true,
-		symEffect:      SymRead | SymWrite,
-		asm:            x86.AANDL,
+		name:         "ANDLmodifyidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		clobberFlags: true,
+		symEffect:    SymRead | SymWrite,
+		asm:          x86.AANDL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 255},   // AX CX DX BX SP BP SI DI
@@ -5236,13 +5263,12 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "ORLmodifyidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		clobberFlags:   true,
-		faultOnNilArg0: true,
-		symEffect:      SymRead | SymWrite,
-		asm:            x86.AORL,
+		name:         "ORLmodifyidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		clobberFlags: true,
+		symEffect:    SymRead | SymWrite,
+		asm:          x86.AORL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 255},   // AX CX DX BX SP BP SI DI
@@ -5252,13 +5278,12 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "XORLmodifyidx4",
-		auxType:        auxSymOff,
-		argLen:         4,
-		clobberFlags:   true,
-		faultOnNilArg0: true,
-		symEffect:      SymRead | SymWrite,
-		asm:            x86.AXORL,
+		name:         "XORLmodifyidx4",
+		auxType:      auxSymOff,
+		argLen:       4,
+		clobberFlags: true,
+		symEffect:    SymRead | SymWrite,
+		asm:          x86.AXORL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 255},   // AX CX DX BX SP BP SI DI
@@ -5324,13 +5349,12 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "ADDLconstmodifyidx4",
-		auxType:        auxSymValAndOff,
-		argLen:         3,
-		clobberFlags:   true,
-		faultOnNilArg0: true,
-		symEffect:      SymRead | SymWrite,
-		asm:            x86.AADDL,
+		name:         "ADDLconstmodifyidx4",
+		auxType:      auxSymValAndOff,
+		argLen:       3,
+		clobberFlags: true,
+		symEffect:    SymRead | SymWrite,
+		asm:          x86.AADDL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 255},   // AX CX DX BX SP BP SI DI
@@ -5339,13 +5363,12 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "ANDLconstmodifyidx4",
-		auxType:        auxSymValAndOff,
-		argLen:         3,
-		clobberFlags:   true,
-		faultOnNilArg0: true,
-		symEffect:      SymRead | SymWrite,
-		asm:            x86.AANDL,
+		name:         "ANDLconstmodifyidx4",
+		auxType:      auxSymValAndOff,
+		argLen:       3,
+		clobberFlags: true,
+		symEffect:    SymRead | SymWrite,
+		asm:          x86.AANDL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 255},   // AX CX DX BX SP BP SI DI
@@ -5354,13 +5377,12 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "ORLconstmodifyidx4",
-		auxType:        auxSymValAndOff,
-		argLen:         3,
-		clobberFlags:   true,
-		faultOnNilArg0: true,
-		symEffect:      SymRead | SymWrite,
-		asm:            x86.AORL,
+		name:         "ORLconstmodifyidx4",
+		auxType:      auxSymValAndOff,
+		argLen:       3,
+		clobberFlags: true,
+		symEffect:    SymRead | SymWrite,
+		asm:          x86.AORL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 255},   // AX CX DX BX SP BP SI DI
@@ -5369,13 +5391,12 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "XORLconstmodifyidx4",
-		auxType:        auxSymValAndOff,
-		argLen:         3,
-		clobberFlags:   true,
-		faultOnNilArg0: true,
-		symEffect:      SymRead | SymWrite,
-		asm:            x86.AXORL,
+		name:         "XORLconstmodifyidx4",
+		auxType:      auxSymValAndOff,
+		argLen:       3,
+		clobberFlags: true,
+		symEffect:    SymRead | SymWrite,
+		asm:          x86.AXORL,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 255},   // AX CX DX BX SP BP SI DI
@@ -6696,7 +6717,6 @@ var opcodeTable = [...]opInfo{
 	{
 		name:         "HMULQ",
 		argLen:       2,
-		commutative:  true,
 		clobberFlags: true,
 		asm:          x86.AIMULQ,
 		reg: regInfo{
@@ -6713,7 +6733,6 @@ var opcodeTable = [...]opInfo{
 	{
 		name:         "HMULL",
 		argLen:       2,
-		commutative:  true,
 		clobberFlags: true,
 		asm:          x86.AIMULL,
 		reg: regInfo{
@@ -6730,7 +6749,6 @@ var opcodeTable = [...]opInfo{
 	{
 		name:         "HMULQU",
 		argLen:       2,
-		commutative:  true,
 		clobberFlags: true,
 		asm:          x86.AMULQ,
 		reg: regInfo{
@@ -6747,7 +6765,6 @@ var opcodeTable = [...]opInfo{
 	{
 		name:         "HMULLU",
 		argLen:       2,
-		commutative:  true,
 		clobberFlags: true,
 		asm:          x86.AMULL,
 		reg: regInfo{
@@ -7529,6 +7546,217 @@ var opcodeTable = [...]opInfo{
 		asm:            x86.ACMPB,
 		reg: regInfo{
 			inputs: []inputInfo{
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:      "CMPQloadidx8",
+		auxType:   auxSymOff,
+		argLen:    4,
+		symEffect: SymRead,
+		asm:       x86.ACMPQ,
+		scale:     8,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{2, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:        "CMPQloadidx1",
+		auxType:     auxSymOff,
+		argLen:      4,
+		commutative: true,
+		symEffect:   SymRead,
+		asm:         x86.ACMPQ,
+		scale:       1,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{2, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:      "CMPLloadidx4",
+		auxType:   auxSymOff,
+		argLen:    4,
+		symEffect: SymRead,
+		asm:       x86.ACMPL,
+		scale:     4,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{2, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:        "CMPLloadidx1",
+		auxType:     auxSymOff,
+		argLen:      4,
+		commutative: true,
+		symEffect:   SymRead,
+		asm:         x86.ACMPL,
+		scale:       1,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{2, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:      "CMPWloadidx2",
+		auxType:   auxSymOff,
+		argLen:    4,
+		symEffect: SymRead,
+		asm:       x86.ACMPW,
+		scale:     2,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{2, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:        "CMPWloadidx1",
+		auxType:     auxSymOff,
+		argLen:      4,
+		commutative: true,
+		symEffect:   SymRead,
+		asm:         x86.ACMPW,
+		scale:       1,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{2, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:        "CMPBloadidx1",
+		auxType:     auxSymOff,
+		argLen:      4,
+		commutative: true,
+		symEffect:   SymRead,
+		asm:         x86.ACMPB,
+		scale:       1,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{2, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:      "CMPQconstloadidx8",
+		auxType:   auxSymValAndOff,
+		argLen:    3,
+		symEffect: SymRead,
+		asm:       x86.ACMPQ,
+		scale:     8,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:        "CMPQconstloadidx1",
+		auxType:     auxSymValAndOff,
+		argLen:      3,
+		commutative: true,
+		symEffect:   SymRead,
+		asm:         x86.ACMPQ,
+		scale:       1,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:      "CMPLconstloadidx4",
+		auxType:   auxSymValAndOff,
+		argLen:    3,
+		symEffect: SymRead,
+		asm:       x86.ACMPL,
+		scale:     4,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:        "CMPLconstloadidx1",
+		auxType:     auxSymValAndOff,
+		argLen:      3,
+		commutative: true,
+		symEffect:   SymRead,
+		asm:         x86.ACMPL,
+		scale:       1,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:      "CMPWconstloadidx2",
+		auxType:   auxSymValAndOff,
+		argLen:    3,
+		symEffect: SymRead,
+		asm:       x86.ACMPW,
+		scale:     2,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:        "CMPWconstloadidx1",
+		auxType:     auxSymValAndOff,
+		argLen:      3,
+		commutative: true,
+		symEffect:   SymRead,
+		asm:         x86.ACMPW,
+		scale:       1,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
+			},
+		},
+	},
+	{
+		name:        "CMPBconstloadidx1",
+		auxType:     auxSymValAndOff,
+		argLen:      3,
+		commutative: true,
+		symEffect:   SymRead,
+		asm:         x86.ACMPB,
+		scale:       1,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
 				{0, 4295032831}, // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15 SB
 			},
 		},
@@ -10973,12 +11201,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:      "MOVBstoreidx1",
-		auxType:   auxSymOff,
-		argLen:    4,
-		symEffect: SymWrite,
-		asm:       x86.AMOVB,
-		scale:     1,
+		name:        "MOVBstoreidx1",
+		auxType:     auxSymOff,
+		argLen:      4,
+		commutative: true,
+		symEffect:   SymWrite,
+		asm:         x86.AMOVB,
+		scale:       1,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
@@ -10988,12 +11217,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:      "MOVWstoreidx1",
-		auxType:   auxSymOff,
-		argLen:    4,
-		symEffect: SymWrite,
-		asm:       x86.AMOVW,
-		scale:     1,
+		name:        "MOVWstoreidx1",
+		auxType:     auxSymOff,
+		argLen:      4,
+		commutative: true,
+		symEffect:   SymWrite,
+		asm:         x86.AMOVW,
+		scale:       1,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
@@ -11018,12 +11248,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:      "MOVLstoreidx1",
-		auxType:   auxSymOff,
-		argLen:    4,
-		symEffect: SymWrite,
-		asm:       x86.AMOVL,
-		scale:     1,
+		name:        "MOVLstoreidx1",
+		auxType:     auxSymOff,
+		argLen:      4,
+		commutative: true,
+		symEffect:   SymWrite,
+		asm:         x86.AMOVL,
+		scale:       1,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
@@ -11063,12 +11294,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:      "MOVQstoreidx1",
-		auxType:   auxSymOff,
-		argLen:    4,
-		symEffect: SymWrite,
-		asm:       x86.AMOVQ,
-		scale:     1,
+		name:        "MOVQstoreidx1",
+		auxType:     auxSymOff,
+		argLen:      4,
+		commutative: true,
+		symEffect:   SymWrite,
+		asm:         x86.AMOVQ,
+		scale:       1,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
@@ -11145,12 +11377,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:      "MOVBstoreconstidx1",
-		auxType:   auxSymValAndOff,
-		argLen:    3,
-		symEffect: SymWrite,
-		asm:       x86.AMOVB,
-		scale:     1,
+		name:        "MOVBstoreconstidx1",
+		auxType:     auxSymValAndOff,
+		argLen:      3,
+		commutative: true,
+		symEffect:   SymWrite,
+		asm:         x86.AMOVB,
+		scale:       1,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
@@ -11159,12 +11392,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:      "MOVWstoreconstidx1",
-		auxType:   auxSymValAndOff,
-		argLen:    3,
-		symEffect: SymWrite,
-		asm:       x86.AMOVW,
-		scale:     1,
+		name:        "MOVWstoreconstidx1",
+		auxType:     auxSymValAndOff,
+		argLen:      3,
+		commutative: true,
+		symEffect:   SymWrite,
+		asm:         x86.AMOVW,
+		scale:       1,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
@@ -11187,12 +11421,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:      "MOVLstoreconstidx1",
-		auxType:   auxSymValAndOff,
-		argLen:    3,
-		symEffect: SymWrite,
-		asm:       x86.AMOVL,
-		scale:     1,
+		name:        "MOVLstoreconstidx1",
+		auxType:     auxSymValAndOff,
+		argLen:      3,
+		commutative: true,
+		symEffect:   SymWrite,
+		asm:         x86.AMOVL,
+		scale:       1,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
@@ -11215,12 +11450,13 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:      "MOVQstoreconstidx1",
-		auxType:   auxSymValAndOff,
-		argLen:    3,
-		symEffect: SymWrite,
-		asm:       x86.AMOVQ,
-		scale:     1,
+		name:        "MOVQstoreconstidx1",
+		auxType:     auxSymValAndOff,
+		argLen:      3,
+		commutative: true,
+		symEffect:   SymWrite,
+		asm:         x86.AMOVQ,
+		scale:       1,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 65535},      // AX CX DX BX SP BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
@@ -11411,9 +11647,21 @@ var opcodeTable = [...]opInfo{
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 128}, // DI
-				{1, 1},   // AX
+				{1, 879}, // AX CX DX BX BP SI R8 R9
 			},
 			clobbers: 4294901760, // X0 X1 X2 X3 X4 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15
+		},
+	},
+	{
+		name:              "LoweredHasCPUFeature",
+		auxType:           auxSym,
+		argLen:            0,
+		rematerializeable: true,
+		symEffect:         SymNone,
+		reg: regInfo{
+			outputs: []outputInfo{
+				{0, 65519}, // AX CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+			},
 		},
 	},
 	{
@@ -17369,7 +17617,7 @@ var opcodeTable = [...]opInfo{
 	},
 	{
 		name:         "BFI",
-		auxType:      auxInt64,
+		auxType:      auxARM64BitField,
 		argLen:       2,
 		resultInArg0: true,
 		asm:          arm64.ABFI,
@@ -17385,7 +17633,7 @@ var opcodeTable = [...]opInfo{
 	},
 	{
 		name:         "BFXIL",
-		auxType:      auxInt64,
+		auxType:      auxARM64BitField,
 		argLen:       2,
 		resultInArg0: true,
 		asm:          arm64.ABFXIL,
@@ -17401,7 +17649,7 @@ var opcodeTable = [...]opInfo{
 	},
 	{
 		name:    "SBFIZ",
-		auxType: auxInt64,
+		auxType: auxARM64BitField,
 		argLen:  1,
 		asm:     arm64.ASBFIZ,
 		reg: regInfo{
@@ -17415,7 +17663,7 @@ var opcodeTable = [...]opInfo{
 	},
 	{
 		name:    "SBFX",
-		auxType: auxInt64,
+		auxType: auxARM64BitField,
 		argLen:  1,
 		asm:     arm64.ASBFX,
 		reg: regInfo{
@@ -17429,7 +17677,7 @@ var opcodeTable = [...]opInfo{
 	},
 	{
 		name:    "UBFIZ",
-		auxType: auxInt64,
+		auxType: auxARM64BitField,
 		argLen:  1,
 		asm:     arm64.AUBFIZ,
 		reg: regInfo{
@@ -17443,7 +17691,7 @@ var opcodeTable = [...]opInfo{
 	},
 	{
 		name:    "UBFX",
-		auxType: auxInt64,
+		auxType: auxARM64BitField,
 		argLen:  1,
 		asm:     arm64.AUBFX,
 		reg: regInfo{
@@ -23758,12 +24006,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVBZloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AMOVBZ,
+		name:   "MOVBZloadidx",
+		argLen: 3,
+		asm:    ppc64.AMOVBZ,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 1073733624}, // R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23775,12 +24020,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVHloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AMOVH,
+		name:   "MOVHloadidx",
+		argLen: 3,
+		asm:    ppc64.AMOVH,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 1073733624}, // R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23792,12 +24034,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVHZloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AMOVHZ,
+		name:   "MOVHZloadidx",
+		argLen: 3,
+		asm:    ppc64.AMOVHZ,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 1073733624}, // R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23809,12 +24048,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVWloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AMOVW,
+		name:   "MOVWloadidx",
+		argLen: 3,
+		asm:    ppc64.AMOVW,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 1073733624}, // R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23826,12 +24062,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVWZloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AMOVWZ,
+		name:   "MOVWZloadidx",
+		argLen: 3,
+		asm:    ppc64.AMOVWZ,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 1073733624}, // R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23843,12 +24076,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVDloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AMOVD,
+		name:   "MOVDloadidx",
+		argLen: 3,
+		asm:    ppc64.AMOVD,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 1073733624}, // R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23860,12 +24090,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVHBRloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AMOVHBR,
+		name:   "MOVHBRloadidx",
+		argLen: 3,
+		asm:    ppc64.AMOVHBR,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 1073733624}, // R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23877,12 +24104,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVWBRloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AMOVWBR,
+		name:   "MOVWBRloadidx",
+		argLen: 3,
+		asm:    ppc64.AMOVWBR,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 1073733624}, // R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23894,12 +24118,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVDBRloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AMOVDBR,
+		name:   "MOVDBRloadidx",
+		argLen: 3,
+		asm:    ppc64.AMOVDBR,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{1, 1073733624}, // R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23911,12 +24132,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "FMOVDloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AFMOVD,
+		name:   "FMOVDloadidx",
+		argLen: 3,
+		asm:    ppc64.AFMOVD,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 1073733630}, // SP SB R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23928,12 +24146,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "FMOVSloadidx",
-		auxType:        auxSymOff,
-		argLen:         3,
-		faultOnNilArg0: true,
-		symEffect:      SymRead,
-		asm:            ppc64.AFMOVS,
+		name:   "FMOVSloadidx",
+		argLen: 3,
+		asm:    ppc64.AFMOVS,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 1073733630}, // SP SB R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -23946,7 +24161,7 @@ var opcodeTable = [...]opInfo{
 	},
 	{
 		name:           "MOVDBRstore",
-		auxType:        auxSymOff,
+		auxType:        auxSym,
 		argLen:         3,
 		faultOnNilArg0: true,
 		symEffect:      SymWrite,
@@ -23960,7 +24175,7 @@ var opcodeTable = [...]opInfo{
 	},
 	{
 		name:           "MOVWBRstore",
-		auxType:        auxSymOff,
+		auxType:        auxSym,
 		argLen:         3,
 		faultOnNilArg0: true,
 		symEffect:      SymWrite,
@@ -23974,7 +24189,7 @@ var opcodeTable = [...]opInfo{
 	},
 	{
 		name:           "MOVHBRstore",
-		auxType:        auxSymOff,
+		auxType:        auxSym,
 		argLen:         3,
 		faultOnNilArg0: true,
 		symEffect:      SymWrite,
@@ -24103,12 +24318,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVBstoreidx",
-		auxType:        auxSymOff,
-		argLen:         4,
-		faultOnNilArg0: true,
-		symEffect:      SymWrite,
-		asm:            ppc64.AMOVB,
+		name:   "MOVBstoreidx",
+		argLen: 4,
+		asm:    ppc64.AMOVB,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 1073733630}, // SP SB R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -24118,12 +24330,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVHstoreidx",
-		auxType:        auxSymOff,
-		argLen:         4,
-		faultOnNilArg0: true,
-		symEffect:      SymWrite,
-		asm:            ppc64.AMOVH,
+		name:   "MOVHstoreidx",
+		argLen: 4,
+		asm:    ppc64.AMOVH,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 1073733630}, // SP SB R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -24133,12 +24342,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVWstoreidx",
-		auxType:        auxSymOff,
-		argLen:         4,
-		faultOnNilArg0: true,
-		symEffect:      SymWrite,
-		asm:            ppc64.AMOVW,
+		name:   "MOVWstoreidx",
+		argLen: 4,
+		asm:    ppc64.AMOVW,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 1073733630}, // SP SB R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -24148,12 +24354,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVDstoreidx",
-		auxType:        auxSymOff,
-		argLen:         4,
-		faultOnNilArg0: true,
-		symEffect:      SymWrite,
-		asm:            ppc64.AMOVD,
+		name:   "MOVDstoreidx",
+		argLen: 4,
+		asm:    ppc64.AMOVD,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 1073733630}, // SP SB R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -24163,12 +24366,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "FMOVDstoreidx",
-		auxType:        auxSymOff,
-		argLen:         4,
-		faultOnNilArg0: true,
-		symEffect:      SymWrite,
-		asm:            ppc64.AFMOVD,
+		name:   "FMOVDstoreidx",
+		argLen: 4,
+		asm:    ppc64.AFMOVD,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{2, 576460743713488896}, // F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15 F16 F17 F18 F19 F20 F21 F22 F23 F24 F25 F26
@@ -24178,12 +24378,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "FMOVSstoreidx",
-		auxType:        auxSymOff,
-		argLen:         4,
-		faultOnNilArg0: true,
-		symEffect:      SymWrite,
-		asm:            ppc64.AFMOVS,
+		name:   "FMOVSstoreidx",
+		argLen: 4,
+		asm:    ppc64.AFMOVS,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{2, 576460743713488896}, // F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15 F16 F17 F18 F19 F20 F21 F22 F23 F24 F25 F26
@@ -24193,12 +24390,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVHBRstoreidx",
-		auxType:        auxSymOff,
-		argLen:         4,
-		faultOnNilArg0: true,
-		symEffect:      SymWrite,
-		asm:            ppc64.AMOVHBR,
+		name:   "MOVHBRstoreidx",
+		argLen: 4,
+		asm:    ppc64.AMOVHBR,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 1073733630}, // SP SB R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -24208,12 +24402,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVWBRstoreidx",
-		auxType:        auxSymOff,
-		argLen:         4,
-		faultOnNilArg0: true,
-		symEffect:      SymWrite,
-		asm:            ppc64.AMOVWBR,
+		name:   "MOVWBRstoreidx",
+		argLen: 4,
+		asm:    ppc64.AMOVWBR,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 1073733630}, // SP SB R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -24223,12 +24414,9 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
-		name:           "MOVDBRstoreidx",
-		auxType:        auxSymOff,
-		argLen:         4,
-		faultOnNilArg0: true,
-		symEffect:      SymWrite,
-		asm:            ppc64.AMOVDBR,
+		name:   "MOVDBRstoreidx",
+		argLen: 4,
+		asm:    ppc64.AMOVDBR,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 1073733630}, // SP SB R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R14 R15 R16 R17 R18 R19 R20 R21 R22 R23 R24 R25 R26 R27 R28 R29
@@ -24996,6 +25184,16 @@ var opcodeTable = [...]opInfo{
 		argLen: 0,
 		reg:    regInfo{},
 	},
+	{
+		name:   "FlagCarrySet",
+		argLen: 0,
+		reg:    regInfo{},
+	},
+	{
+		name:   "FlagCarryClear",
+		argLen: 0,
+		reg:    regInfo{},
+	},
 
 	{
 		name:        "ADD",
@@ -25027,9 +25225,63 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
+		name:    "ADDIW",
+		auxType: auxInt64,
+		argLen:  1,
+		asm:     riscv.AADDIW,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:   "NEG",
+		argLen: 1,
+		asm:    riscv.ANEG,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:   "NEGW",
+		argLen: 1,
+		asm:    riscv.ANEGW,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
 		name:   "SUB",
 		argLen: 2,
 		asm:    riscv.ASUB,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{1, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:   "SUBW",
+		argLen: 2,
+		asm:    riscv.ASUBW,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
@@ -25445,6 +25697,58 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
+		name:           "MOVBstorezero",
+		auxType:        auxSymOff,
+		argLen:         2,
+		faultOnNilArg0: true,
+		symEffect:      SymWrite,
+		asm:            riscv.AMOVB,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 9223372037928517622}, // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+		},
+	},
+	{
+		name:           "MOVHstorezero",
+		auxType:        auxSymOff,
+		argLen:         2,
+		faultOnNilArg0: true,
+		symEffect:      SymWrite,
+		asm:            riscv.AMOVH,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 9223372037928517622}, // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+		},
+	},
+	{
+		name:           "MOVWstorezero",
+		auxType:        auxSymOff,
+		argLen:         2,
+		faultOnNilArg0: true,
+		symEffect:      SymWrite,
+		asm:            riscv.AMOVW,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 9223372037928517622}, // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+		},
+	},
+	{
+		name:           "MOVDstorezero",
+		auxType:        auxSymOff,
+		argLen:         2,
+		faultOnNilArg0: true,
+		symEffect:      SymWrite,
+		asm:            riscv.AMOV,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 9223372037928517622}, // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+		},
+	},
+	{
 		name:   "SLL",
 		argLen: 2,
 		asm:    riscv.ASLL,
@@ -25616,6 +25920,19 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
+		name:   "NOT",
+		argLen: 1,
+		asm:    riscv.ANOT,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
 		name:   "SEQZ",
 		argLen: 1,
 		asm:    riscv.ASEQZ,
@@ -25771,6 +26088,183 @@ var opcodeTable = [...]opInfo{
 				{2, 1073741748}, // X3 X5 X6 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
 			},
 			clobbers: 112, // X5 X6 X7
+		},
+	},
+	{
+		name:           "LoweredAtomicLoad8",
+		argLen:         2,
+		faultOnNilArg0: true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 9223372037928517622}, // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:           "LoweredAtomicLoad32",
+		argLen:         2,
+		faultOnNilArg0: true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 9223372037928517622}, // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:           "LoweredAtomicLoad64",
+		argLen:         2,
+		faultOnNilArg0: true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 9223372037928517622}, // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:           "LoweredAtomicStore8",
+		argLen:         3,
+		faultOnNilArg0: true,
+		hasSideEffects: true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 1073741814},          // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{0, 9223372037928517622}, // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+		},
+	},
+	{
+		name:           "LoweredAtomicStore32",
+		argLen:         3,
+		faultOnNilArg0: true,
+		hasSideEffects: true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 1073741814},          // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{0, 9223372037928517622}, // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+		},
+	},
+	{
+		name:           "LoweredAtomicStore64",
+		argLen:         3,
+		faultOnNilArg0: true,
+		hasSideEffects: true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 1073741814},          // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{0, 9223372037928517622}, // SP X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+		},
+	},
+	{
+		name:            "LoweredAtomicExchange32",
+		argLen:          3,
+		resultNotInArgs: true,
+		faultOnNilArg0:  true,
+		hasSideEffects:  true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 1073741820},          // X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{0, 9223372037928517630}, // SP X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:            "LoweredAtomicExchange64",
+		argLen:          3,
+		resultNotInArgs: true,
+		faultOnNilArg0:  true,
+		hasSideEffects:  true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 1073741820},          // X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{0, 9223372037928517630}, // SP X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:            "LoweredAtomicAdd32",
+		argLen:          3,
+		resultNotInArgs: true,
+		faultOnNilArg0:  true,
+		hasSideEffects:  true,
+		unsafePoint:     true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 1073741820},          // X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{0, 9223372037928517630}, // SP X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:            "LoweredAtomicAdd64",
+		argLen:          3,
+		resultNotInArgs: true,
+		faultOnNilArg0:  true,
+		hasSideEffects:  true,
+		unsafePoint:     true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 1073741820},          // X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{0, 9223372037928517630}, // SP X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:            "LoweredAtomicCas32",
+		argLen:          4,
+		resultNotInArgs: true,
+		faultOnNilArg0:  true,
+		hasSideEffects:  true,
+		unsafePoint:     true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 1073741820},          // X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{2, 1073741820},          // X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{0, 9223372037928517630}, // SP X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
+		},
+	},
+	{
+		name:            "LoweredAtomicCas64",
+		argLen:          4,
+		resultNotInArgs: true,
+		faultOnNilArg0:  true,
+		hasSideEffects:  true,
+		unsafePoint:     true,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{1, 1073741820},          // X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{2, 1073741820},          // X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+				{0, 9223372037928517630}, // SP X3 g X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30 SB
+			},
+			outputs: []outputInfo{
+				{0, 1073741812}, // X3 X5 X6 X7 X8 X9 X10 X11 X12 X13 X14 X15 X16 X17 X18 X19 X20 X21 X22 X23 X24 X25 X26 X27 X28 X29 X30
+			},
 		},
 	},
 	{
@@ -27746,6 +28240,26 @@ var opcodeTable = [...]opInfo{
 		},
 	},
 	{
+		name:   "LTDBR",
+		argLen: 1,
+		asm:    s390x.ALTDBR,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 4294901760}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15
+			},
+		},
+	},
+	{
+		name:   "LTEBR",
+		argLen: 1,
+		asm:    s390x.ALTEBR,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 4294901760}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15
+			},
+		},
+	},
+	{
 		name:   "SLD",
 		argLen: 2,
 		asm:    s390x.ASLD,
@@ -28286,6 +28800,110 @@ var opcodeTable = [...]opInfo{
 		name:   "CDGBRA",
 		argLen: 1,
 		asm:    s390x.ACDGBRA,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 23551}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R11 R12 R14
+			},
+			outputs: []outputInfo{
+				{0, 4294901760}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15
+			},
+		},
+	},
+	{
+		name:   "CLFEBR",
+		argLen: 1,
+		asm:    s390x.ACLFEBR,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 4294901760}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15
+			},
+			outputs: []outputInfo{
+				{0, 23551}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R11 R12 R14
+			},
+		},
+	},
+	{
+		name:   "CLFDBR",
+		argLen: 1,
+		asm:    s390x.ACLFDBR,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 4294901760}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15
+			},
+			outputs: []outputInfo{
+				{0, 23551}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R11 R12 R14
+			},
+		},
+	},
+	{
+		name:   "CLGEBR",
+		argLen: 1,
+		asm:    s390x.ACLGEBR,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 4294901760}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15
+			},
+			outputs: []outputInfo{
+				{0, 23551}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R11 R12 R14
+			},
+		},
+	},
+	{
+		name:   "CLGDBR",
+		argLen: 1,
+		asm:    s390x.ACLGDBR,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 4294901760}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15
+			},
+			outputs: []outputInfo{
+				{0, 23551}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R11 R12 R14
+			},
+		},
+	},
+	{
+		name:   "CELFBR",
+		argLen: 1,
+		asm:    s390x.ACELFBR,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 23551}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R11 R12 R14
+			},
+			outputs: []outputInfo{
+				{0, 4294901760}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15
+			},
+		},
+	},
+	{
+		name:   "CDLFBR",
+		argLen: 1,
+		asm:    s390x.ACDLFBR,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 23551}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R11 R12 R14
+			},
+			outputs: []outputInfo{
+				{0, 4294901760}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15
+			},
+		},
+	},
+	{
+		name:   "CELGBR",
+		argLen: 1,
+		asm:    s390x.ACELGBR,
+		reg: regInfo{
+			inputs: []inputInfo{
+				{0, 23551}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R11 R12 R14
+			},
+			outputs: []outputInfo{
+				{0, 4294901760}, // F0 F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15
+			},
+		},
+	},
+	{
+		name:   "CDLGBR",
+		argLen: 1,
+		asm:    s390x.ACDLGBR,
 		reg: regInfo{
 			inputs: []inputInfo{
 				{0, 23551}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R11 R12 R14
@@ -29506,6 +30124,7 @@ var opcodeTable = [...]opInfo{
 		name:           "STMG2",
 		auxType:        auxSymOff,
 		argLen:         4,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymWrite,
 		asm:            s390x.ASTMG,
@@ -29521,6 +30140,7 @@ var opcodeTable = [...]opInfo{
 		name:           "STMG3",
 		auxType:        auxSymOff,
 		argLen:         5,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymWrite,
 		asm:            s390x.ASTMG,
@@ -29537,6 +30157,7 @@ var opcodeTable = [...]opInfo{
 		name:           "STMG4",
 		auxType:        auxSymOff,
 		argLen:         6,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymWrite,
 		asm:            s390x.ASTMG,
@@ -29554,6 +30175,7 @@ var opcodeTable = [...]opInfo{
 		name:           "STM2",
 		auxType:        auxSymOff,
 		argLen:         4,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymWrite,
 		asm:            s390x.ASTMY,
@@ -29569,6 +30191,7 @@ var opcodeTable = [...]opInfo{
 		name:           "STM3",
 		auxType:        auxSymOff,
 		argLen:         5,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymWrite,
 		asm:            s390x.ASTMY,
@@ -29585,6 +30208,7 @@ var opcodeTable = [...]opInfo{
 		name:           "STM4",
 		auxType:        auxSymOff,
 		argLen:         6,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymWrite,
 		asm:            s390x.ASTMY,
@@ -31922,92 +32546,12 @@ var opcodeTable = [...]opInfo{
 		generic: true,
 	},
 	{
-		name:    "Greater8",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Greater8U",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Greater16",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Greater16U",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Greater32",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Greater32U",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Greater64",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Greater64U",
-		argLen:  2,
-		generic: true,
-	},
-	{
 		name:    "Greater32F",
 		argLen:  2,
 		generic: true,
 	},
 	{
 		name:    "Greater64F",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Geq8",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Geq8U",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Geq16",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Geq16U",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Geq32",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Geq32U",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Geq64",
-		argLen:  2,
-		generic: true,
-	},
-	{
-		name:    "Geq64U",
 		argLen:  2,
 		generic: true,
 	},
@@ -32450,6 +32994,13 @@ var opcodeTable = [...]opInfo{
 		generic:   true,
 	},
 	{
+		name:      "HasCPUFeature",
+		auxType:   auxSym,
+		argLen:    0,
+		symEffect: SymNone,
+		generic:   true,
+	},
+	{
 		name:    "PanicBounds",
 		auxType: auxInt64,
 		argLen:  3,
@@ -32620,6 +33171,11 @@ var opcodeTable = [...]opInfo{
 	},
 	{
 		name:    "Cvt64Fto32F",
+		argLen:  1,
+		generic: true,
+	},
+	{
+		name:    "CvtBoolToUint8",
 		argLen:  1,
 		generic: true,
 	},
@@ -32915,6 +33471,16 @@ var opcodeTable = [...]opInfo{
 	{
 		name:    "Slicemask",
 		argLen:  1,
+		generic: true,
+	},
+	{
+		name:    "SpectreIndex",
+		argLen:  2,
+		generic: true,
+	},
+	{
+		name:    "SpectreSliceIndex",
+		argLen:  2,
 		generic: true,
 	},
 	{

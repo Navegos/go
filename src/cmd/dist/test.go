@@ -98,9 +98,11 @@ func (t *tester) run() {
 		os.Setenv("PATH", fmt.Sprintf("%s%c%s", gobin, os.PathListSeparator, os.Getenv("PATH")))
 	}
 
-	slurp, err := exec.Command("go", "env", "CGO_ENABLED").Output()
+	cmd := exec.Command("go", "env", "CGO_ENABLED")
+	cmd.Stderr = new(bytes.Buffer)
+	slurp, err := cmd.Output()
 	if err != nil {
-		fatalf("Error running go env CGO_ENABLED: %v", err)
+		fatalf("Error running go env CGO_ENABLED: %v\n%s", err, cmd.Stderr)
 	}
 	t.cgoEnabled, _ = strconv.ParseBool(strings.TrimSpace(string(slurp)))
 	if flag.NArg() > 0 && t.runRxStr != "" {
@@ -581,7 +583,7 @@ func (t *tester) registerTests() {
 	}
 
 	// Test internal linking of PIE binaries where it is supported.
-	if goos == "linux" && (goarch == "amd64" || goarch == "arm64") {
+	if t.internalLinkPIE() {
 		t.tests = append(t.tests, distTest{
 			name:    "pie_internal",
 			heading: "internal linking of -buildmode=pie",
@@ -739,7 +741,12 @@ func (t *tester) registerTests() {
 			})
 		}
 	}
-	if goos != "android" && !t.iOS() && goos != "js" {
+	// Only run the API check on fast development platforms. Android, iOS, and JS
+	// are always cross-compiled, and the filesystems on our only plan9 builders
+	// are too slow to complete in a reasonable timeframe. Every platform checks
+	// the API on every GOOS/GOARCH/CGO_ENABLED combination anyway, so we really
+	// only need to run this check once anywhere to get adequate coverage.
+	if goos != "android" && !t.iOS() && goos != "js" && goos != "plan9" {
 		t.tests = append(t.tests, distTest{
 			name:    "api",
 			heading: "API check",
@@ -894,7 +901,7 @@ func (t *tester) extLink() bool {
 	pair := gohostos + "-" + goarch
 	switch pair {
 	case "aix-ppc64",
-		"android-arm",
+		"android-arm", "android-arm64",
 		"darwin-386", "darwin-amd64", "darwin-arm", "darwin-arm64",
 		"dragonfly-amd64",
 		"freebsd-386", "freebsd-amd64", "freebsd-arm",
@@ -934,6 +941,17 @@ func (t *tester) internalLink() bool {
 		return false
 	}
 	return true
+}
+
+func (t *tester) internalLinkPIE() bool {
+	switch goos + "-" + goarch {
+	case "linux-amd64", "linux-arm64",
+		"android-arm64":
+		return true
+	case "windows-amd64", "windows-386", "windows-arm":
+		return true
+	}
+	return false
 }
 
 func (t *tester) supportedBuildmode(mode string) bool {
@@ -987,6 +1005,8 @@ func (t *tester) supportedBuildmode(mode string) bool {
 			"android-amd64", "android-arm", "android-arm64", "android-386":
 			return true
 		case "darwin-amd64":
+			return true
+		case "windows-amd64", "windows-386", "windows-arm":
 			return true
 		}
 		return false
@@ -1062,7 +1082,7 @@ func (t *tester) cgoTest(dt *distTest) error {
 		cmd = t.addCmd(dt, "misc/cgo/test", t.goTest(), "-ldflags", "-linkmode=external -s")
 
 	case "aix-ppc64",
-		"android-arm",
+		"android-arm", "android-arm64",
 		"dragonfly-amd64",
 		"freebsd-386", "freebsd-amd64", "freebsd-arm",
 		"linux-386", "linux-amd64", "linux-arm", "linux-ppc64le", "linux-s390x",
@@ -1110,6 +1130,9 @@ func (t *tester) cgoTest(dt *distTest) error {
 
 			if t.supportedBuildmode("pie") {
 				t.addCmd(dt, "misc/cgo/test", t.goTest(), "-buildmode=pie")
+				if t.internalLink() && t.internalLinkPIE() {
+					t.addCmd(dt, "misc/cgo/test", t.goTest(), "-buildmode=pie", "-ldflags=-linkmode=internal")
+				}
 				t.addCmd(dt, "misc/cgo/testtls", t.goTest(), "-buildmode=pie")
 				t.addCmd(dt, "misc/cgo/nocgo", t.goTest(), "-buildmode=pie")
 			}
@@ -1509,9 +1532,6 @@ func (t *tester) shouldUsePrecompiledStdTest() bool {
 }
 
 func (t *tester) shouldTestCmd() bool {
-	if t.race {
-		return false
-	}
 	if goos == "js" && goarch == "wasm" {
 		// Issues 25911, 35220
 		return false

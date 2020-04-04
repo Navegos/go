@@ -1651,6 +1651,35 @@ func TestSelect(t *testing.T) {
 	}
 }
 
+func TestSelectMaxCases(t *testing.T) {
+	var sCases []SelectCase
+	channel := make(chan int)
+	close(channel)
+	for i := 0; i < 65536; i++ {
+		sCases = append(sCases, SelectCase{
+			Dir:  SelectRecv,
+			Chan: ValueOf(channel),
+		})
+	}
+	// Should not panic
+	_, _, _ = Select(sCases)
+	sCases = append(sCases, SelectCase{
+		Dir:  SelectRecv,
+		Chan: ValueOf(channel),
+	})
+	defer func() {
+		if err := recover(); err != nil {
+			if err.(string) != "reflect.Select: too many cases (max 65536)" {
+				t.Fatalf("unexpected error from select call with greater than max supported cases")
+			}
+		} else {
+			t.Fatalf("expected select call to panic with greater than max supported cases")
+		}
+	}()
+	// Should panic
+	_, _, _ = Select(sCases)
+}
+
 // selectWatch and the selectWatcher are a watchdog mechanism for running Select.
 // If the selectWatcher notices that the select has been blocked for >1 second, it prints
 // an error describing the select and panics the entire test binary.
@@ -4131,6 +4160,37 @@ func TestConvert(t *testing.T) {
 				t.Errorf("(%s).ConvertibleTo(%s) = %v, want %v", t1, t2, ok, expectOK)
 			}
 		}
+	}
+}
+
+var gFloat32 float32
+
+func TestConvertNaNs(t *testing.T) {
+	const snan uint32 = 0x7f800001
+
+	// Test to see if a store followed by a load of a signaling NaN
+	// maintains the signaling bit. The only platform known to fail
+	// this test is 386,GO386=387. The real test below will always fail
+	// if the platform can't even store+load a float without mucking
+	// with the bits.
+	gFloat32 = math.Float32frombits(snan)
+	runtime.Gosched() // make sure we don't optimize the store/load away
+	r := math.Float32bits(gFloat32)
+	if r != snan {
+		// This should only happen on 386,GO386=387. We have no way to
+		// test for 387, so we just make sure we're at least on 386.
+		if runtime.GOARCH != "386" {
+			t.Errorf("store/load of sNaN not faithful")
+		}
+		t.Skip("skipping test, float store+load not faithful")
+	}
+
+	type myFloat32 float32
+	x := V(myFloat32(math.Float32frombits(snan)))
+	y := x.Convert(TypeOf(float32(0)))
+	z := y.Interface().(float32)
+	if got := math.Float32bits(z); got != snan {
+		t.Errorf("signaling nan conversion got %x, want %x", got, snan)
 	}
 }
 
