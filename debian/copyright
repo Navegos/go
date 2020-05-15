@@ -3,7 +3,7 @@ Upstream-Name: golang
 Source: https://github.com/golang/go
 
 Files: *
-Copyright: © 2009, 2010, The Go Authors.  All rights reserved.
+Copyright: © 2009, 2020, The Go Authors.  All rights reserved.
 License: Go
 
 Files:

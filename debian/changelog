@@ -1,4 +1,10 @@
-golang-1.14 (1.14.2-1ubuntu2.1~20.04.0) focal; urgency=medium
+golang-1.15 (1.15.1-1ubuntu2.1~20.04.0) focal; urgency=medium
+
+  * Imported googlesource master Upstream version 1.15.1
+
+ -- Navegos QA <navegos@outlook.com>  Sun, 15 May 2020 13:25:45 +0000
+ 
+ golang-1.14 (1.14.2-1ubuntu2.1~20.04.0) focal; urgency=medium
 
   * Imported googlesource master Upstream version 1.14.2
 
