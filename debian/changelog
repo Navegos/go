@@ -1,18 +1,24 @@
+golang-1.16 (1.16.0-1ubuntu2) focal; urgency=medium
+
+  * Imported golang master Upstream version 1.16.0
+
+ -- Navegos QA <navegos@outlook.com>  Sun, 3 Dec 2020 21:25:32 +0000
+ 
 golang-1.15 (1.15.1-1ubuntu2) focal; urgency=medium
 
-  * Imported googlesource master Upstream version 1.15.1
+  * Imported golang master Upstream version 1.15.1
 
  -- Navegos QA <navegos@outlook.com>  Sun, 15 May 2020 13:25:45 +0000
  
 golang-1.14 (1.14.2-1ubuntu2.1~20.04.0) focal; urgency=medium
 
-  * Imported googlesource master Upstream version 1.14.2
+  * Imported golang master Upstream version 1.14.2
 
  -- Navegos QA <navegos@outlook.com>  Sun, 9 Jan 2020 18:45:14 +0000
  
 golang-1.14 (1.14.1-1ubuntu2.1~18.04.5) bionic; urgency=medium
 
-  * Imported googlesource master Upstream version 1.14.1
+  * Imported golang master Upstream version 1.14.1
 
  -- Navegos QA <navegos@outlook.com>  Sun, 26 Jan 2020 22:34:14 +0000
 
