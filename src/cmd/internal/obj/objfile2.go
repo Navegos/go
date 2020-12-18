@@ -9,7 +9,7 @@ package obj
 import (
 	"bytes"
 	"cmd/internal/bio"
-	"cmd/internal/goobj2"
+	"cmd/internal/goobj"
 	"cmd/internal/objabi"
 	"fmt"
 	"path/filepath"
@@ -24,7 +24,7 @@ func WriteObjFile2(ctxt *Link, b *bio.Writer, pkgpath string) {
 	genFuncInfoSyms(ctxt)
 
 	w := writer{
-		Writer:  goobj2.NewWriter(b),
+		Writer:  goobj.NewWriter(b),
 		ctxt:    ctxt,
 		pkgpath: objabi.PathToPrefix(pkgpath),
 	}
@@ -36,10 +36,10 @@ func WriteObjFile2(ctxt *Link, b *bio.Writer, pkgpath string) {
 	// We just reserve the space. We'll fill in the offsets later.
 	flags := uint32(0)
 	if ctxt.Flag_shared {
-		flags |= goobj2.ObjFlagShared
+		flags |= goobj.ObjFlagShared
 	}
-	h := goobj2.Header{
-		Magic:       goobj2.Magic,
+	h := goobj.Header{
+		Magic:       goobj.Magic,
 		Fingerprint: ctxt.Fingerprint,
 		Flags:       flags,
 	}
@@ -49,43 +49,43 @@ func WriteObjFile2(ctxt *Link, b *bio.Writer, pkgpath string) {
 	w.StringTable()
 
 	// Autolib
-	h.Offsets[goobj2.BlkAutolib] = w.Offset()
+	h.Offsets[goobj.BlkAutolib] = w.Offset()
 	for i := range ctxt.Imports {
 		ctxt.Imports[i].Write(w.Writer)
 	}
 
 	// Package references
-	h.Offsets[goobj2.BlkPkgIdx] = w.Offset()
+	h.Offsets[goobj.BlkPkgIdx] = w.Offset()
 	for _, pkg := range w.pkglist {
 		w.StringRef(pkg)
 	}
 
 	// DWARF file table
-	h.Offsets[goobj2.BlkDwarfFile] = w.Offset()
+	h.Offsets[goobj.BlkDwarfFile] = w.Offset()
 	for _, f := range ctxt.PosTable.DebugLinesFileTable() {
 		w.StringRef(filepath.ToSlash(f))
 	}
 
 	// Symbol definitions
-	h.Offsets[goobj2.BlkSymdef] = w.Offset()
+	h.Offsets[goobj.BlkSymdef] = w.Offset()
 	for _, s := range ctxt.defs {
 		w.Sym(s)
 	}
 
 	// Non-pkg symbol definitions
-	h.Offsets[goobj2.BlkNonpkgdef] = w.Offset()
+	h.Offsets[goobj.BlkNonpkgdef] = w.Offset()
 	for _, s := range ctxt.nonpkgdefs {
 		w.Sym(s)
 	}
 
 	// Non-pkg symbol references
-	h.Offsets[goobj2.BlkNonpkgref] = w.Offset()
+	h.Offsets[goobj.BlkNonpkgref] = w.Offset()
 	for _, s := range ctxt.nonpkgrefs {
 		w.Sym(s)
 	}
 
 	// Reloc indexes
-	h.Offsets[goobj2.BlkRelocIdx] = w.Offset()
+	h.Offsets[goobj.BlkRelocIdx] = w.Offset()
 	nreloc := uint32(0)
 	lists := [][]*LSym{ctxt.defs, ctxt.nonpkgdefs}
 	for _, list := range lists {
@@ -97,7 +97,7 @@ func WriteObjFile2(ctxt *Link, b *bio.Writer, pkgpath string) {
 	w.Uint32(nreloc)
 
 	// Symbol Info indexes
-	h.Offsets[goobj2.BlkAuxIdx] = w.Offset()
+	h.Offsets[goobj.BlkAuxIdx] = w.Offset()
 	naux := uint32(0)
 	for _, list := range lists {
 		for _, s := range list {
@@ -108,7 +108,7 @@ func WriteObjFile2(ctxt *Link, b *bio.Writer, pkgpath string) {
 	w.Uint32(naux)
 
 	// Data indexes
-	h.Offsets[goobj2.BlkDataIdx] = w.Offset()
+	h.Offsets[goobj.BlkDataIdx] = w.Offset()
 	dataOff := uint32(0)
 	for _, list := range lists {
 		for _, s := range list {
@@ -119,7 +119,7 @@ func WriteObjFile2(ctxt *Link, b *bio.Writer, pkgpath string) {
 	w.Uint32(dataOff)
 
 	// Relocs
-	h.Offsets[goobj2.BlkReloc] = w.Offset()
+	h.Offsets[goobj.BlkReloc] = w.Offset()
 	for _, list := range lists {
 		for _, s := range list {
 			for i := range s.R {
@@ -129,7 +129,7 @@ func WriteObjFile2(ctxt *Link, b *bio.Writer, pkgpath string) {
 	}
 
 	// Aux symbol info
-	h.Offsets[goobj2.BlkAux] = w.Offset()
+	h.Offsets[goobj.BlkAux] = w.Offset()
 	for _, list := range lists {
 		for _, s := range list {
 			w.Aux(s)
@@ -137,7 +137,7 @@ func WriteObjFile2(ctxt *Link, b *bio.Writer, pkgpath string) {
 	}
 
 	// Data
-	h.Offsets[goobj2.BlkData] = w.Offset()
+	h.Offsets[goobj.BlkData] = w.Offset()
 	for _, list := range lists {
 		for _, s := range list {
 			w.Bytes(s.P)
@@ -145,7 +145,7 @@ func WriteObjFile2(ctxt *Link, b *bio.Writer, pkgpath string) {
 	}
 
 	// Pcdata
-	h.Offsets[goobj2.BlkPcdata] = w.Offset()
+	h.Offsets[goobj.BlkPcdata] = w.Offset()
 	for _, s := range ctxt.Text { // iteration order must match genFuncInfoSyms
 		if s.Func != nil {
 			pc := &s.Func.Pcln
@@ -167,7 +167,7 @@ func WriteObjFile2(ctxt *Link, b *bio.Writer, pkgpath string) {
 }
 
 type writer struct {
-	*goobj2.Writer
+	*goobj.Writer
 	ctxt    *Link
 	pkgpath string   // the package import path (escaped), "" if unknown
 	pkglist []string // list of packages referenced, indexed by ctxt.pkgIdx
@@ -217,32 +217,32 @@ func (w *writer) StringTable() {
 func (w *writer) Sym(s *LSym) {
 	abi := uint16(s.ABI())
 	if s.Static() {
-		abi = goobj2.SymABIstatic
+		abi = goobj.SymABIstatic
 	}
 	flag := uint8(0)
 	if s.DuplicateOK() {
-		flag |= goobj2.SymFlagDupok
+		flag |= goobj.SymFlagDupok
 	}
 	if s.Local() {
-		flag |= goobj2.SymFlagLocal
+		flag |= goobj.SymFlagLocal
 	}
 	if s.MakeTypelink() {
-		flag |= goobj2.SymFlagTypelink
+		flag |= goobj.SymFlagTypelink
 	}
 	if s.Leaf() {
-		flag |= goobj2.SymFlagLeaf
+		flag |= goobj.SymFlagLeaf
 	}
 	if s.NoSplit() {
-		flag |= goobj2.SymFlagNoSplit
+		flag |= goobj.SymFlagNoSplit
 	}
 	if s.ReflectMethod() {
-		flag |= goobj2.SymFlagReflectMethod
+		flag |= goobj.SymFlagReflectMethod
 	}
 	if s.TopFrame() {
-		flag |= goobj2.SymFlagTopFrame
+		flag |= goobj.SymFlagTopFrame
 	}
 	if strings.HasPrefix(s.Name, "type.") && s.Name[5] != '.' && s.Type == objabi.SRODATA {
-		flag |= goobj2.SymFlagGoType
+		flag |= goobj.SymFlagGoType
 	}
 	name := s.Name
 	if strings.HasPrefix(name, "gofile..") {
@@ -252,7 +252,7 @@ func (w *writer) Sym(s *LSym) {
 	if s.Func != nil {
 		align = uint32(s.Func.Align)
 	}
-	var o goobj2.Sym
+	var o goobj.Sym
 	o.SetName(name, w.Writer)
 	o.SetABI(abi)
 	o.SetType(uint8(s.Type))
@@ -262,19 +262,19 @@ func (w *writer) Sym(s *LSym) {
 	o.Write(w.Writer)
 }
 
-func makeSymRef(s *LSym) goobj2.SymRef {
+func makeSymRef(s *LSym) goobj.SymRef {
 	if s == nil {
-		return goobj2.SymRef{}
+		return goobj.SymRef{}
 	}
 	if s.PkgIdx == 0 || !s.Indexed() {
 		fmt.Printf("unindexed symbol reference: %v\n", s)
 		panic("unindexed symbol reference")
 	}
-	return goobj2.SymRef{PkgIdx: uint32(s.PkgIdx), SymIdx: uint32(s.SymIdx)}
+	return goobj.SymRef{PkgIdx: uint32(s.PkgIdx), SymIdx: uint32(s.SymIdx)}
 }
 
 func (w *writer) Reloc(r *Reloc) {
-	var o goobj2.Reloc
+	var o goobj.Reloc
 	o.SetOff(r.Off)
 	o.SetSiz(r.Siz)
 	o.SetType(uint8(r.Type))
@@ -284,7 +284,7 @@ func (w *writer) Reloc(r *Reloc) {
 }
 
 func (w *writer) aux1(typ uint8, rs *LSym) {
-	var o goobj2.Aux
+	var o goobj.Aux
 	o.SetType(typ)
 	o.SetSym(makeSymRef(rs))
 	o.Write(w.Writer)
@@ -292,26 +292,26 @@ func (w *writer) aux1(typ uint8, rs *LSym) {
 
 func (w *writer) Aux(s *LSym) {
 	if s.Gotype != nil {
-		w.aux1(goobj2.AuxGotype, s.Gotype)
+		w.aux1(goobj.AuxGotype, s.Gotype)
 	}
 	if s.Func != nil {
-		w.aux1(goobj2.AuxFuncInfo, s.Func.FuncInfoSym)
+		w.aux1(goobj.AuxFuncInfo, s.Func.FuncInfoSym)
 
 		for _, d := range s.Func.Pcln.Funcdata {
-			w.aux1(goobj2.AuxFuncdata, d)
+			w.aux1(goobj.AuxFuncdata, d)
 		}
 
 		if s.Func.dwarfInfoSym != nil && s.Func.dwarfInfoSym.Size != 0 {
-			w.aux1(goobj2.AuxDwarfInfo, s.Func.dwarfInfoSym)
+			w.aux1(goobj.AuxDwarfInfo, s.Func.dwarfInfoSym)
 		}
 		if s.Func.dwarfLocSym != nil && s.Func.dwarfLocSym.Size != 0 {
-			w.aux1(goobj2.AuxDwarfLoc, s.Func.dwarfLocSym)
+			w.aux1(goobj.AuxDwarfLoc, s.Func.dwarfLocSym)
 		}
 		if s.Func.dwarfRangesSym != nil && s.Func.dwarfRangesSym.Size != 0 {
-			w.aux1(goobj2.AuxDwarfRanges, s.Func.dwarfRangesSym)
+			w.aux1(goobj.AuxDwarfRanges, s.Func.dwarfRangesSym)
 		}
 		if s.Func.dwarfDebugLinesSym != nil && s.Func.dwarfDebugLinesSym.Size != 0 {
-			w.aux1(goobj2.AuxDwarfLines, s.Func.dwarfDebugLinesSym)
+			w.aux1(goobj.AuxDwarfLines, s.Func.dwarfDebugLinesSym)
 		}
 	}
 }
@@ -351,7 +351,7 @@ func genFuncInfoSyms(ctxt *Link) {
 		if s.Func == nil {
 			continue
 		}
-		o := goobj2.FuncInfo{
+		o := goobj.FuncInfo{
 			Args:   uint32(s.Func.Args),
 			Locals: uint32(s.Func.Locals),
 		}
@@ -374,16 +374,16 @@ func genFuncInfoSyms(ctxt *Link) {
 		for i, x := range pc.Funcdataoff {
 			o.Funcdataoff[i] = uint32(x)
 		}
-		o.File = make([]goobj2.SymRef, len(pc.File))
+		o.File = make([]goobj.SymRef, len(pc.File))
 		for i, f := range pc.File {
 			fsym := ctxt.Lookup(f)
 			o.File[i] = makeSymRef(fsym)
 		}
-		o.InlTree = make([]goobj2.InlTreeNode, len(pc.InlTree.nodes))
+		o.InlTree = make([]goobj.InlTreeNode, len(pc.InlTree.nodes))
 		for i, inl := range pc.InlTree.nodes {
 			f, l := linkgetlineFromPos(ctxt, inl.Pos)
 			fsym := ctxt.Lookup(f)
-			o.InlTree[i] = goobj2.InlTreeNode{
+			o.InlTree[i] = goobj.InlTreeNode{
 				Parent:   int32(inl.Parent),
 				File:     makeSymRef(fsym),
 				Line:     l,
@@ -395,7 +395,7 @@ func genFuncInfoSyms(ctxt *Link) {
 		o.Write(&b)
 		isym := &LSym{
 			Type:   objabi.SDATA, // for now, I don't think it matters
-			PkgIdx: goobj2.PkgIdxSelf,
+			PkgIdx: goobj.PkgIdxSelf,
 			SymIdx: symidx,
 			P:      append([]byte(nil), b.Bytes()...),
 		}
@@ -410,7 +410,7 @@ func genFuncInfoSyms(ctxt *Link) {
 			if s == nil || s.Size == 0 {
 				continue
 			}
-			s.PkgIdx = goobj2.PkgIdxSelf
+			s.PkgIdx = goobj.PkgIdxSelf
 			s.SymIdx = symidx
 			s.Set(AttrIndexed, true)
 			symidx++

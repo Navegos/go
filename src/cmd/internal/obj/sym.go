@@ -32,7 +32,7 @@
 package obj
 
 import (
-	"cmd/internal/goobj2"
+	"cmd/internal/goobj"
 	"cmd/internal/objabi"
 	"crypto/md5"
 	"fmt"
@@ -186,7 +186,7 @@ func (ctxt *Link) NumberSyms(asm bool) {
 	var idx, nonpkgidx int32 = 0, 0
 	ctxt.traverseSyms(traverseDefs, func(s *LSym) {
 		if isNonPkgSym(ctxt, asm, s) {
-			s.PkgIdx = goobj2.PkgIdxNone
+			s.PkgIdx = goobj.PkgIdxNone
 			s.SymIdx = nonpkgidx
 			if nonpkgidx != int32(len(ctxt.nonpkgdefs)) {
 				panic("bad index")
@@ -194,7 +194,7 @@ func (ctxt *Link) NumberSyms(asm bool) {
 			ctxt.nonpkgdefs = append(ctxt.nonpkgdefs, s)
 			nonpkgidx++
 		} else {
-			s.PkgIdx = goobj2.PkgIdxSelf
+			s.PkgIdx = goobj.PkgIdxSelf
 			s.SymIdx = idx
 			if idx != int32(len(ctxt.defs)) {
 				panic("bad index")
@@ -208,15 +208,15 @@ func (ctxt *Link) NumberSyms(asm bool) {
 	ipkg := int32(1) // 0 is invalid index
 	nonpkgdef := nonpkgidx
 	ctxt.traverseSyms(traverseRefs|traverseAux, func(rs *LSym) {
-		if rs.PkgIdx != goobj2.PkgIdxInvalid {
+		if rs.PkgIdx != goobj.PkgIdxInvalid {
 			return
 		}
 		if !ctxt.Flag_linkshared {
 			// Assign special index for builtin symbols.
 			// Don't do it when linking against shared libraries, as the runtime
 			// may be in a different library.
-			if i := goobj2.BuiltinIdx(rs.Name, int(rs.ABI())); i != -1 {
-				rs.PkgIdx = goobj2.PkgIdxBuiltin
+			if i := goobj.BuiltinIdx(rs.Name, int(rs.ABI())); i != -1 {
+				rs.PkgIdx = goobj.PkgIdxBuiltin
 				rs.SymIdx = int32(i)
 				rs.Set(AttrIndexed, true)
 				return
@@ -224,7 +224,7 @@ func (ctxt *Link) NumberSyms(asm bool) {
 		}
 		pkg := rs.Pkg
 		if pkg == "" || pkg == "\"\"" || pkg == "_" || !rs.Indexed() {
-			rs.PkgIdx = goobj2.PkgIdxNone
+			rs.PkgIdx = goobj.PkgIdxNone
 			rs.SymIdx = nonpkgidx
 			rs.Set(AttrIndexed, true)
 			if nonpkgidx != nonpkgdef+int32(len(ctxt.nonpkgrefs)) {
