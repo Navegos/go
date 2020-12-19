@@ -115,7 +115,6 @@ func (out *OutBuf) Close() error {
 	if out.isMmapped() {
 		out.copyHeap()
 		out.munmap()
-		return nil
 	}
 	if out.f == nil {
 		return nil
@@ -188,7 +187,9 @@ func (out *OutBuf) writeLoc(lenToWrite int64) (int64, []byte) {
 		// See if our heap would grow to be too large, and if so, copy it to the end
 		// of the mmapped area.
 		if heapLen > maxOutBufHeapLen && out.copyHeap() {
-			heapPos, heapLen, lenNeeded = 0, 0, lenToWrite
+			heapPos -= heapLen
+			lenNeeded = heapPos + lenToWrite
+			heapLen = 0
 		}
 		out.heap = append(out.heap, make([]byte, lenNeeded-heapLen)...)
 	}

@@ -1264,10 +1264,6 @@ func (d *dwctxt2) writelines(unit *sym.CompilationUnit, ls loader.Sym) {
 		}
 	}
 
-	lsu.AddUint8(0) // start extended opcode
-	dwarf.Uleb128put(d, lsDwsym, 1)
-	lsu.AddUint8(dwarf.DW_LNE_end_sequence)
-
 	if d.linkctxt.HeadType == objabi.Haix {
 		saveDwsectCUSize(".debug_line", unit.Lib.Pkg, uint64(lsu.Size()-unitLengthOffset))
 	}

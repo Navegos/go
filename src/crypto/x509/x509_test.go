@@ -1674,9 +1674,13 @@ func TestMaxPathLenNotCA(t *testing.T) {
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 	}
-	cert := serialiseAndParse(t, template)
-	if m := cert.MaxPathLen; m != -1 {
+	if m := serialiseAndParse(t, template).MaxPathLen; m != -1 {
 		t.Errorf("MaxPathLen should be -1 when IsCa is false, got %d", m)
+	}
+
+	template.MaxPathLen = -1
+	if m := serialiseAndParse(t, template).MaxPathLen; m != -1 {
+		t.Errorf("MaxPathLen should be -1 when IsCa is false and MaxPathLen set to -1, got %d", m)
 	}
 
 	template.MaxPathLen = 5
@@ -1691,8 +1695,7 @@ func TestMaxPathLenNotCA(t *testing.T) {
 	}
 
 	template.BasicConstraintsValid = false
-	cert2 := serialiseAndParse(t, template)
-	if m := cert2.MaxPathLen; m != 0 {
+	if m := serialiseAndParse(t, template).MaxPathLen; m != 0 {
 		t.Errorf("Bad MaxPathLen should be ignored if BasicConstraintsValid is false, got %d", m)
 	}
 }
@@ -2073,10 +2076,31 @@ func TestPKIXNameString(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Check that parsed non-standard attributes are printed.
+	rdns := pkix.Name{
+		Locality: []string{"Gophertown"},
+		ExtraNames: []pkix.AttributeTypeAndValue{
+			{Type: asn1.ObjectIdentifier([]int{1, 2, 3, 4, 5}), Value: "golang.org"}},
+	}.ToRDNSequence()
+	nn := pkix.Name{}
+	nn.FillFromRDNSequence(&rdns)
+
+	// Check that zero-length non-nil ExtraNames hide Names.
+	extra := []pkix.AttributeTypeAndValue{
+		{Type: asn1.ObjectIdentifier([]int{1, 2, 3, 4, 5}), Value: "backing array"}}
+	extraNotNil := pkix.Name{
+		Locality:   []string{"Gophertown"},
+		ExtraNames: extra[:0],
+		Names: []pkix.AttributeTypeAndValue{
+			{Type: asn1.ObjectIdentifier([]int{1, 2, 3, 4, 5}), Value: "golang.org"}},
+	}
+
 	tests := []struct {
 		dn   pkix.Name
 		want string
 	}{
+		{nn, "L=Gophertown,1.2.3.4.5=#130a676f6c616e672e6f7267"},
+		{extraNotNil, "L=Gophertown"},
 		{pkix.Name{
 			CommonName:         "Steve Kille",
 			Organization:       []string{"Isode Limited"},
@@ -2105,12 +2129,30 @@ func TestPKIXNameString(t *testing.T) {
 			ExtraNames: []pkix.AttributeTypeAndValue{
 				{Type: asn1.ObjectIdentifier([]int{1, 2, 3, 4, 5}), Value: "golang.org"}},
 		}, "1.2.3.4.5=#130a676f6c616e672e6f7267,L=Gophertown"},
+		// If there are no ExtraNames, the Names are printed instead.
+		{pkix.Name{
+			Locality: []string{"Gophertown"},
+			Names: []pkix.AttributeTypeAndValue{
+				{Type: asn1.ObjectIdentifier([]int{1, 2, 3, 4, 5}), Value: "golang.org"}},
+		}, "L=Gophertown,1.2.3.4.5=#130a676f6c616e672e6f7267"},
+		// If there are both, print only the ExtraNames.
+		{pkix.Name{
+			Locality: []string{"Gophertown"},
+			ExtraNames: []pkix.AttributeTypeAndValue{
+				{Type: asn1.ObjectIdentifier([]int{1, 2, 3, 4, 5}), Value: "golang.org"}},
+			Names: []pkix.AttributeTypeAndValue{
+				{Type: asn1.ObjectIdentifier([]int{1, 2, 3, 4, 6}), Value: "example.com"}},
+		}, "1.2.3.4.5=#130a676f6c616e672e6f7267,L=Gophertown"},
 	}
 
 	for i, test := range tests {
 		if got := test.dn.String(); got != test.want {
 			t.Errorf("#%d: String() = \n%s\n, want \n%s", i, got, test.want)
 		}
+	}
+
+	if extra[0].Value != "backing array" {
+		t.Errorf("the backing array of an empty ExtraNames got modified by String")
 	}
 }
 
