@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 // +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
 
 // Fork, exec, wait, etc.
@@ -9,6 +10,7 @@
 package syscall
 
 import (
+	errorspkg "errors"
 	"internal/bytealg"
 	"runtime"
 	"sync"
@@ -187,6 +189,15 @@ func forkExec(argv0 string, argv []string, attr *ProcAttr) (pid int, err error) 
 		}
 	}
 
+	// Both Setctty and Foreground use the Ctty field,
+	// but they give it slightly different meanings.
+	if sys.Setctty && sys.Foreground {
+		return 0, errorspkg.New("both Setctty and Foreground set in SysProcAttr")
+	}
+	if sys.Setctty && sys.Ctty >= len(attr.Files) {
+		return 0, errorspkg.New("Setctty set but Ctty not valid in child")
+	}
+
 	// Acquire the fork lock so that no other threads
 	// create new fds that are not yet close-on-exec
 	// before we fork.
@@ -207,7 +218,12 @@ func forkExec(argv0 string, argv []string, attr *ProcAttr) (pid int, err error) 
 
 	// Read child error status from pipe.
 	Close(p[1])
-	n, err = readlen(p[0], (*byte)(unsafe.Pointer(&err1)), int(unsafe.Sizeof(err1)))
+	for {
+		n, err = readlen(p[0], (*byte)(unsafe.Pointer(&err1)), int(unsafe.Sizeof(err1)))
+		if err != EINTR {
+			break
+		}
+	}
 	Close(p[0])
 	if err != nil || n != 0 {
 		if n == int(unsafe.Sizeof(err1)) {
@@ -257,6 +273,7 @@ func runtime_AfterExec()
 // avoids a build dependency for other platforms.
 var execveLibc func(path uintptr, argv uintptr, envp uintptr) Errno
 var execveDarwin func(path *byte, argv **byte, envp **byte) error
+var execveOpenBSD func(path *byte, argv **byte, envp **byte) error
 
 // Exec invokes the execve(2) system call.
 func Exec(argv0 string, argv []string, envv []string) (err error) {
@@ -281,9 +298,12 @@ func Exec(argv0 string, argv []string, envv []string) (err error) {
 			uintptr(unsafe.Pointer(argv0p)),
 			uintptr(unsafe.Pointer(&argvp[0])),
 			uintptr(unsafe.Pointer(&envvp[0])))
-	} else if runtime.GOOS == "darwin" {
+	} else if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
 		// Similarly on Darwin.
 		err1 = execveDarwin(argv0p, &argvp[0], &envvp[0])
+	} else if runtime.GOOS == "openbsd" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64") {
+		// Similarly on OpenBSD.
+		err1 = execveOpenBSD(argv0p, &argvp[0], &envvp[0])
 	} else {
 		_, _, err1 = RawSyscall(SYS_EXECVE,
 			uintptr(unsafe.Pointer(argv0p)),

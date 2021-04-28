@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 // +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
 
 package net
@@ -10,8 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"internal/poll"
-	"io/ioutil"
 	"os"
 	"path"
 	"reflect"
@@ -236,7 +235,7 @@ type resolvConfTest struct {
 }
 
 func newResolvConfTest() (*resolvConfTest, error) {
-	dir, err := ioutil.TempDir("", "go-resolvconftest")
+	dir, err := os.MkdirTemp("", "go-resolvconftest")
 	if err != nil {
 		return nil, err
 	}
@@ -480,7 +479,7 @@ func TestGoLookupIPWithResolverConfig(t *testing.T) {
 			break
 		default:
 			time.Sleep(10 * time.Millisecond)
-			return dnsmessage.Message{}, poll.ErrTimeout
+			return dnsmessage.Message{}, os.ErrDeadlineExceeded
 		}
 		r := dnsmessage.Message{
 			Header: dnsmessage.Header{
@@ -602,14 +601,14 @@ func TestGoLookupIPOrderFallbackToFile(t *testing.T) {
 		name := fmt.Sprintf("order %v", order)
 
 		// First ensure that we get an error when contacting a non-existent host.
-		_, _, err := r.goLookupIPCNAMEOrder(context.Background(), "notarealhost", order)
+		_, _, err := r.goLookupIPCNAMEOrder(context.Background(), "ip", "notarealhost", order)
 		if err == nil {
 			t.Errorf("%s: expected error while looking up name not in hosts file", name)
 			continue
 		}
 
 		// Now check that we get an address when the name appears in the hosts file.
-		addrs, _, err := r.goLookupIPCNAMEOrder(context.Background(), "thor", order) // entry is in "testdata/hosts"
+		addrs, _, err := r.goLookupIPCNAMEOrder(context.Background(), "ip", "thor", order) // entry is in "testdata/hosts"
 		if err != nil {
 			t.Errorf("%s: expected to successfully lookup host entry", name)
 			continue
@@ -993,7 +992,7 @@ func TestRetryTimeout(t *testing.T) {
 		if s == "192.0.2.1:53" {
 			deadline0 = deadline
 			time.Sleep(10 * time.Millisecond)
-			return dnsmessage.Message{}, poll.ErrTimeout
+			return dnsmessage.Message{}, os.ErrDeadlineExceeded
 		}
 
 		if deadline.Equal(deadline0) {
@@ -1131,7 +1130,7 @@ func TestStrictErrorsLookupIP(t *testing.T) {
 	}
 	makeTimeout := func() error {
 		return &DNSError{
-			Err:       poll.ErrTimeout.Error(),
+			Err:       os.ErrDeadlineExceeded.Error(),
 			Name:      name,
 			Server:    server,
 			IsTimeout: true,
@@ -1247,7 +1246,7 @@ func TestStrictErrorsLookupIP(t *testing.T) {
 					Questions: q.Questions,
 				}, nil
 			case resolveTimeout:
-				return dnsmessage.Message{}, poll.ErrTimeout
+				return dnsmessage.Message{}, os.ErrDeadlineExceeded
 			default:
 				t.Fatal("Impossible resolveWhich")
 			}
@@ -1372,7 +1371,7 @@ func TestStrictErrorsLookupTXT(t *testing.T) {
 
 		switch q.Questions[0].Name.String() {
 		case searchX:
-			return dnsmessage.Message{}, poll.ErrTimeout
+			return dnsmessage.Message{}, os.ErrDeadlineExceeded
 		case searchY:
 			return mockTXTResponse(q), nil
 		default:
@@ -1387,7 +1386,7 @@ func TestStrictErrorsLookupTXT(t *testing.T) {
 		var wantRRs int
 		if strict {
 			wantErr = &DNSError{
-				Err:       poll.ErrTimeout.Error(),
+				Err:       os.ErrDeadlineExceeded.Error(),
 				Name:      name,
 				Server:    server,
 				IsTimeout: true,
@@ -1415,7 +1414,7 @@ func TestDNSGoroutineRace(t *testing.T) {
 
 	fake := fakeDNSServer{rh: func(n, s string, q dnsmessage.Message, t time.Time) (dnsmessage.Message, error) {
 		time.Sleep(10 * time.Microsecond)
-		return dnsmessage.Message{}, poll.ErrTimeout
+		return dnsmessage.Message{}, os.ErrDeadlineExceeded
 	}}
 	r := Resolver{PreferGo: true, Dial: fake.DialContext}
 

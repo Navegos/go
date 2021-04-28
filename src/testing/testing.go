@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // Package testing provides support for automated testing of Go packages.
-// It is intended to be used in concert with the ``go test'' command, which automates
+// It is intended to be used in concert with the "go test" command, which automates
 // execution of any function of the form
 //     func TestXxx(*testing.T)
 // where Xxx does not start with a lowercase letter. The function name
@@ -14,8 +14,8 @@
 // To write a new test suite, create a file whose name ends _test.go that
 // contains the TestXxx functions as described here. Put the file in the same
 // package as the one being tested. The file will be excluded from regular
-// package builds but will be included when the ``go test'' command is run.
-// For more detail, run ``go help test'' and ``go help testflag''.
+// package builds but will be included when the "go test" command is run.
+// For more detail, run "go help test" and "go help testflag".
 //
 // A simple test function looks like this:
 //
@@ -190,7 +190,7 @@
 //         }
 //     }
 //
-// The race detector kills the program if it exceeds 8192 concurrent goroutines,
+// The race detector kills the program if it exceeds 8128 concurrent goroutines,
 // so use care when running parallel tests with the -race flag set.
 //
 // Run does not return until parallel subtests have completed, providing a way
@@ -208,20 +208,23 @@
 //
 // Main
 //
-// It is sometimes necessary for a test program to do extra setup or teardown
-// before or after testing. It is also sometimes necessary for a test to control
+// It is sometimes necessary for a test or benchmark program to do extra setup or teardown
+// before or after it executes. It is also sometimes necessary to control
 // which code runs on the main thread. To support these and other cases,
 // if a test file contains a function:
 //
 //	func TestMain(m *testing.M)
 //
-// then the generated test will call TestMain(m) instead of running the tests
+// then the generated test will call TestMain(m) instead of running the tests or benchmarks
 // directly. TestMain runs in the main goroutine and can do whatever setup
 // and teardown is necessary around a call to m.Run. m.Run will return an exit
 // code that may be passed to os.Exit. If TestMain returns, the test wrapper
-// will pass the result of m.Run to os.Exit itself. When TestMain is called,
-// flag.Parse has not been run. If TestMain depends on command-line flags,
-// including those of the testing package, it should call flag.Parse explicitly.
+// will pass the result of m.Run to os.Exit itself.
+//
+// When TestMain is called, flag.Parse has not been run. If TestMain depends on
+// command-line flags, including those of the testing package, it should call
+// flag.Parse explicitly. Command line flags are always parsed by the time test
+// or benchmark functions run.
 //
 // A simple implementation of TestMain is:
 //
@@ -239,7 +242,6 @@ import (
 	"fmt"
 	"internal/race"
 	"io"
-	"io/ioutil"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -291,6 +293,7 @@ func Init() {
 	blockProfileRate = flag.Int("test.blockprofilerate", 1, "set blocking profile `rate` (see runtime.SetBlockProfileRate)")
 	mutexProfile = flag.String("test.mutexprofile", "", "write a mutex contention profile to the named file after execution")
 	mutexProfileFraction = flag.Int("test.mutexprofilefraction", 1, "if >= 0, calls runtime.SetMutexProfileFraction()")
+	panicOnExit0 = flag.Bool("test.paniconexit0", false, "panic on call to os.Exit(0)")
 	traceFile = flag.String("test.trace", "", "write an execution trace to `file`")
 	timeout = flag.Duration("test.timeout", 0, "panic test binary after duration `d` (default 0, timeout disabled)")
 	cpuListStr = flag.String("test.cpu", "", "comma-separated `list` of cpu counts to run each test with")
@@ -317,6 +320,7 @@ var (
 	blockProfileRate     *int
 	mutexProfile         *string
 	mutexProfileFraction *int
+	panicOnExit0         *bool
 	traceFile            *string
 	timeout              *time.Duration
 	cpuListStr           *string
@@ -331,6 +335,47 @@ var (
 	numFailed uint32 // number of test failures
 )
 
+type chattyPrinter struct {
+	w          io.Writer
+	lastNameMu sync.Mutex // guards lastName
+	lastName   string     // last printed test name in chatty mode
+}
+
+func newChattyPrinter(w io.Writer) *chattyPrinter {
+	return &chattyPrinter{w: w}
+}
+
+// Updatef prints a message about the status of the named test to w.
+//
+// The formatted message must include the test name itself.
+func (p *chattyPrinter) Updatef(testName, format string, args ...interface{}) {
+	p.lastNameMu.Lock()
+	defer p.lastNameMu.Unlock()
+
+	// Since the message already implies an association with a specific new test,
+	// we don't need to check what the old test name was or log an extra CONT line
+	// for it. (We're updating it anyway, and the current message already includes
+	// the test name.)
+	p.lastName = testName
+	fmt.Fprintf(p.w, format, args...)
+}
+
+// Printf prints a message, generated by the named test, that does not
+// necessarily mention that tests's name itself.
+func (p *chattyPrinter) Printf(testName, format string, args ...interface{}) {
+	p.lastNameMu.Lock()
+	defer p.lastNameMu.Unlock()
+
+	if p.lastName == "" {
+		p.lastName = testName
+	} else if p.lastName != testName {
+		fmt.Fprintf(p.w, "=== CONT  %s\n", testName)
+		p.lastName = testName
+	}
+
+	fmt.Fprintf(p.w, format, args...)
+}
+
 // The maximum number of stack frames to go through when skipping helper functions for
 // the purpose of decorating log messages.
 const maxStackLen = 50
@@ -338,21 +383,25 @@ const maxStackLen = 50
 // common holds the elements common between T and B and
 // captures common methods such as Errorf.
 type common struct {
-	mu      sync.RWMutex        // guards this group of fields
-	output  []byte              // Output generated by test or benchmark.
-	w       io.Writer           // For flushToParent.
-	ran     bool                // Test or benchmark (or one of its subtests) was executed.
-	failed  bool                // Test or benchmark has failed.
-	skipped bool                // Test of benchmark has been skipped.
-	done    bool                // Test is finished and all subtests have completed.
-	helpers map[string]struct{} // functions to be skipped when writing file/line info
-	cleanup func()              // optional function to be called at the end of the test
+	mu          sync.RWMutex         // guards this group of fields
+	output      []byte               // Output generated by test or benchmark.
+	w           io.Writer            // For flushToParent.
+	ran         bool                 // Test or benchmark (or one of its subtests) was executed.
+	failed      bool                 // Test or benchmark has failed.
+	skipped     bool                 // Test or benchmark has been skipped.
+	done        bool                 // Test is finished and all subtests have completed.
+	helperPCs   map[uintptr]struct{} // functions to be skipped when writing file/line info
+	helperNames map[string]struct{}  // helperPCs converted to function names
+	cleanups    []func()             // optional functions to be called at the end of the test
+	cleanupName string               // Name of the cleanup function.
+	cleanupPc   []uintptr            // The stack trace at the point where Cleanup was called.
+	finished    bool                 // Test function has completed.
 
-	chatty     bool   // A copy of the chatty flag.
-	finished   bool   // Test function has completed.
-	hasSub     int32  // written atomically
-	raceErrors int    // number of races detected during test
-	runner     string // function name of tRunner running the test
+	chatty     *chattyPrinter // A copy of chattyPrinter, if the chatty flag is set.
+	bench      bool           // Whether the current test is a benchmark.
+	hasSub     int32          // Written atomically.
+	raceErrors int            // Number of races detected during test.
+	runner     string         // Function name of tRunner running the test.
 
 	parent   *common
 	level    int       // Nesting depth of test or benchmark.
@@ -364,9 +413,10 @@ type common struct {
 	signal   chan bool // To signal a test is done.
 	sub      []*T      // Queue of subtests to be run in parallel.
 
-	tempDirOnce sync.Once
-	tempDir     string
-	tempDirErr  error
+	tempDirMu  sync.Mutex
+	tempDir    string
+	tempDirErr error
+	tempDirSeq int32
 }
 
 // Short reports whether the -test.short flag is set.
@@ -426,6 +476,10 @@ func (c *common) frameSkip(skip int) runtime.Frame {
 	var firstFrame, prevFrame, frame runtime.Frame
 	for more := true; more; prevFrame = frame {
 		frame, more = frames.Next()
+		if frame.Function == c.cleanupName {
+			frames = runtime.CallersFrames(c.cleanupPc)
+			continue
+		}
 		if firstFrame.PC == 0 {
 			firstFrame = frame
 		}
@@ -455,7 +509,14 @@ func (c *common) frameSkip(skip int) runtime.Frame {
 			}
 			return prevFrame
 		}
-		if _, ok := c.helpers[frame.Function]; !ok {
+		// If more helper PCs have been added since we last did the conversion
+		if c.helperNames == nil {
+			c.helperNames = make(map[string]struct{})
+			for pc := range c.helperPCs {
+				c.helperNames[pcToName(pc)] = struct{}{}
+			}
+		}
+		if _, ok := c.helperNames[frame.Function]; !ok {
 			// Found a frame that wasn't inside a helper function.
 			return frame
 		}
@@ -486,9 +547,6 @@ func (c *common) decorate(s string, skip int) string {
 	buf := new(strings.Builder)
 	// Every line is indented at least 4 spaces.
 	buf.WriteString("    ")
-	if c.chatty {
-		fmt.Fprintf(buf, "%s: ", c.name)
-	}
 	fmt.Fprintf(buf, "%s:%d: ", file, line)
 	lines := strings.Split(s, "\n")
 	if l := len(lines); l > 1 && lines[l-1] == "" {
@@ -507,17 +565,36 @@ func (c *common) decorate(s string, skip int) string {
 
 // flushToParent writes c.output to the parent after first writing the header
 // with the given format and arguments.
-func (c *common) flushToParent(format string, args ...interface{}) {
+func (c *common) flushToParent(testName, format string, args ...interface{}) {
 	p := c.parent
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	fmt.Fprintf(p.w, format, args...)
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	io.Copy(p.w, bytes.NewReader(c.output))
-	c.output = c.output[:0]
+
+	if len(c.output) > 0 {
+		format += "%s"
+		args = append(args[:len(args):len(args)], c.output)
+		c.output = c.output[:0] // but why?
+	}
+
+	if c.chatty != nil && p.w == c.chatty.w {
+		// We're flushing to the actual output, so track that this output is
+		// associated with a specific test (and, specifically, that the next output
+		// is *not* associated with that test).
+		//
+		// Moreover, if c.output is non-empty it is important that this write be
+		// atomic with respect to the output of other tests, so that we don't end up
+		// with confusing '=== CONT' lines in the middle of our '--- PASS' block.
+		// Neither humans nor cmd/test2json can parse those easily.
+		// (See https://golang.org/issue/40771.)
+		c.chatty.Updatef(testName, format, args...)
+	} else {
+		// We're flushing to the output buffer of the parent test, which will
+		// itself follow a test-name header when it is finally flushed to stdout.
+		fmt.Fprintf(p.w, format, args...)
+	}
 }
 
 type indenter struct {
@@ -589,6 +666,7 @@ var _ TB = (*B)(nil)
 type T struct {
 	common
 	isParallel bool
+	isEnvSet   bool
 	context    *testContext // For running tests and subtests.
 }
 
@@ -660,7 +738,9 @@ func (c *common) FailNow() {
 	// it would run on a test failure. Because we send on c.signal during
 	// a top-of-stack deferred function now, we know that the send
 	// only happens after any other stacked defers have completed.
+	c.mu.Lock()
 	c.finished = true
+	c.mu.Unlock()
 	runtime.Goexit()
 }
 
@@ -684,10 +764,17 @@ func (c *common) logDepth(s string, depth int) {
 				return
 			}
 		}
-		panic("Log in goroutine after " + c.name + " has completed")
+		panic("Log in goroutine after " + c.name + " has completed: " + s)
 	} else {
-		if c.chatty {
-			fmt.Print(c.decorate(s, depth+1))
+		if c.chatty != nil {
+			if c.bench {
+				// Benchmarks don't print === CONT, so we should skip the test
+				// printer and just print straight to stdout.
+				fmt.Print(c.decorate(s, depth+1))
+			} else {
+				c.chatty.Printf(c.name, "%s", c.decorate(s, depth+1))
+			}
+
 			return
 		}
 		c.output = append(c.output, c.decorate(s, depth+1)...)
@@ -752,15 +839,11 @@ func (c *common) Skipf(format string, args ...interface{}) {
 // other goroutines created during the test. Calling SkipNow does not stop
 // those other goroutines.
 func (c *common) SkipNow() {
-	c.skip()
-	c.finished = true
-	runtime.Goexit()
-}
-
-func (c *common) skip() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.skipped = true
+	c.finished = true
+	c.mu.Unlock()
+	runtime.Goexit()
 }
 
 // Skipped reports whether the test was skipped.
@@ -776,37 +859,88 @@ func (c *common) Skipped() bool {
 func (c *common) Helper() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.helpers == nil {
-		c.helpers = make(map[string]struct{})
+	if c.helperPCs == nil {
+		c.helperPCs = make(map[uintptr]struct{})
 	}
-	c.helpers[callerName(1)] = struct{}{}
+	// repeating code from callerName here to save walking a stack frame
+	var pc [1]uintptr
+	n := runtime.Callers(2, pc[:]) // skip runtime.Callers + Helper
+	if n == 0 {
+		panic("testing: zero callers found")
+	}
+	if _, found := c.helperPCs[pc[0]]; !found {
+		c.helperPCs[pc[0]] = struct{}{}
+		c.helperNames = nil // map will be recreated next time it is needed
+	}
 }
 
-// Cleanup registers a function to be called when the test and all its
+// Cleanup registers a function to be called when the test (or subtest) and all its
 // subtests complete. Cleanup functions will be called in last added,
 // first called order.
 func (c *common) Cleanup(f func()) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	oldCleanup := c.cleanup
-	c.cleanup = func() {
-		if oldCleanup != nil {
-			defer oldCleanup()
-		}
+	var pc [maxStackLen]uintptr
+	// Skip two extra frames to account for this function and runtime.Callers itself.
+	n := runtime.Callers(2, pc[:])
+	cleanupPc := pc[:n]
+
+	fn := func() {
+		defer func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.cleanupName = ""
+			c.cleanupPc = nil
+		}()
+
+		name := callerName(0)
+		c.mu.Lock()
+		c.cleanupName = name
+		c.cleanupPc = cleanupPc
+		c.mu.Unlock()
+
 		f()
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanups = append(c.cleanups, fn)
+}
+
+var tempDirReplacer struct {
+	sync.Once
+	r *strings.Replacer
 }
 
 // TempDir returns a temporary directory for the test to use.
-// It is lazily created on first access, and calls t.Fatal if the directory
-// creation fails.
-// Subsequent calls to t.TempDir return the same directory.
 // The directory is automatically removed by Cleanup when the test and
 // all its subtests complete.
+// Each subsequent call to t.TempDir returns a unique directory;
+// if the directory creation fails, TempDir terminates the test by calling Fatal.
 func (c *common) TempDir() string {
-	c.tempDirOnce.Do(func() {
+	// Use a single parent directory for all the temporary directories
+	// created by a test, each numbered sequentially.
+	c.tempDirMu.Lock()
+	var nonExistent bool
+	if c.tempDir == "" { // Usually the case with js/wasm
+		nonExistent = true
+	} else {
+		_, err := os.Stat(c.tempDir)
+		nonExistent = os.IsNotExist(err)
+		if err != nil && !nonExistent {
+			c.Fatalf("TempDir: %v", err)
+		}
+	}
+
+	if nonExistent {
 		c.Helper()
-		c.tempDir, c.tempDirErr = ioutil.TempDir("", c.Name())
+
+		// os.MkdirTemp doesn't like path separators in its pattern,
+		// so mangle the name to accommodate subtests.
+		tempDirReplacer.Do(func() {
+			tempDirReplacer.r = strings.NewReplacer("/", "_", "\\", "_", ":", "_")
+		})
+		pattern := tempDirReplacer.r.Replace(c.Name())
+
+		c.tempDir, c.tempDirErr = os.MkdirTemp("", pattern)
 		if c.tempDirErr == nil {
 			c.Cleanup(func() {
 				if err := os.RemoveAll(c.tempDir); err != nil {
@@ -814,11 +948,41 @@ func (c *common) TempDir() string {
 				}
 			})
 		}
-	})
+	}
+	c.tempDirMu.Unlock()
+
 	if c.tempDirErr != nil {
 		c.Fatalf("TempDir: %v", c.tempDirErr)
 	}
-	return c.tempDir
+	seq := atomic.AddInt32(&c.tempDirSeq, 1)
+	dir := fmt.Sprintf("%s%c%03d", c.tempDir, os.PathSeparator, seq)
+	if err := os.Mkdir(dir, 0777); err != nil {
+		c.Fatalf("TempDir: %v", err)
+	}
+	return dir
+}
+
+// Setenv calls os.Setenv(key, value) and uses Cleanup to
+// restore the environment variable to its original value
+// after the test.
+//
+// This cannot be used in parallel tests.
+func (c *common) Setenv(key, value string) {
+	prevValue, ok := os.LookupEnv(key)
+
+	if err := os.Setenv(key, value); err != nil {
+		c.Fatalf("cannot set environment variable: %v", err)
+	}
+
+	if ok {
+		c.Cleanup(func() {
+			os.Setenv(key, prevValue)
+		})
+	} else {
+		c.Cleanup(func() {
+			os.Unsetenv(key)
+		})
+	}
 }
 
 // panicHanding is an argument to runCleanup.
@@ -833,34 +997,53 @@ const (
 // If catchPanic is true, this will catch panics, and return the recovered
 // value if any.
 func (c *common) runCleanup(ph panicHandling) (panicVal interface{}) {
-	c.mu.Lock()
-	cleanup := c.cleanup
-	c.cleanup = nil
-	c.mu.Unlock()
-	if cleanup == nil {
-		return nil
-	}
-
 	if ph == recoverAndReturnPanic {
 		defer func() {
 			panicVal = recover()
 		}()
 	}
 
-	cleanup()
-	return nil
+	// Make sure that if a cleanup function panics,
+	// we still run the remaining cleanup functions.
+	defer func() {
+		c.mu.Lock()
+		recur := len(c.cleanups) > 0
+		c.mu.Unlock()
+		if recur {
+			c.runCleanup(normalPanic)
+		}
+	}()
+
+	for {
+		var cleanup func()
+		c.mu.Lock()
+		if len(c.cleanups) > 0 {
+			last := len(c.cleanups) - 1
+			cleanup = c.cleanups[last]
+			c.cleanups = c.cleanups[:last]
+		}
+		c.mu.Unlock()
+		if cleanup == nil {
+			return nil
+		}
+		cleanup()
+	}
 }
 
 // callerName gives the function name (qualified with a package path)
 // for the caller after skip frames (where 0 means the current function).
 func callerName(skip int) string {
-	// Make room for the skip PC.
 	var pc [1]uintptr
 	n := runtime.Callers(skip+2, pc[:]) // skip + runtime.Callers + callerName
 	if n == 0 {
 		panic("testing: zero callers found")
 	}
-	frames := runtime.CallersFrames(pc[:n])
+	return pcToName(pc[0])
+}
+
+func pcToName(pc uintptr) string {
+	pcs := []uintptr{pc}
+	frames := runtime.CallersFrames(pcs)
 	frame, _ := frames.Next()
 	return frame.Function
 }
@@ -873,6 +1056,9 @@ func (t *T) Parallel() {
 	if t.isParallel {
 		panic("testing: t.Parallel called multiple times")
 	}
+	if t.isEnvSet {
+		panic("testing: t.Parallel called after t.Setenv; cannot set environment variables in parallel tests")
+	}
 	t.isParallel = true
 
 	// We don't want to include the time we spend waiting for serial tests
@@ -884,32 +1070,41 @@ func (t *T) Parallel() {
 	t.parent.sub = append(t.parent.sub, t)
 	t.raceErrors += race.Errors()
 
-	if t.chatty {
-		// Print directly to root's io.Writer so there is no delay.
-		root := t.parent
-		for ; root.parent != nil; root = root.parent {
-		}
-		root.mu.Lock()
-		fmt.Fprintf(root.w, "=== PAUSE %s\n", t.name)
-		root.mu.Unlock()
+	if t.chatty != nil {
+		// Unfortunately, even though PAUSE indicates that the named test is *no
+		// longer* running, cmd/test2json interprets it as changing the active test
+		// for the purpose of log parsing. We could fix cmd/test2json, but that
+		// won't fix existing deployments of third-party tools that already shell
+		// out to older builds of cmd/test2json — so merely fixing cmd/test2json
+		// isn't enough for now.
+		t.chatty.Updatef(t.name, "=== PAUSE %s\n", t.name)
 	}
 
 	t.signal <- true   // Release calling test.
 	<-t.parent.barrier // Wait for the parent test to complete.
 	t.context.waitParallel()
 
-	if t.chatty {
-		// Print directly to root's io.Writer so there is no delay.
-		root := t.parent
-		for ; root.parent != nil; root = root.parent {
-		}
-		root.mu.Lock()
-		fmt.Fprintf(root.w, "=== CONT  %s\n", t.name)
-		root.mu.Unlock()
+	if t.chatty != nil {
+		t.chatty.Updatef(t.name, "=== CONT  %s\n", t.name)
 	}
 
 	t.start = time.Now()
 	t.raceErrors += -race.Errors()
+}
+
+// Setenv calls os.Setenv(key, value) and uses Cleanup to
+// restore the environment variable to its original value
+// after the test.
+//
+// This cannot be used in parallel tests.
+func (t *T) Setenv(key, value string) {
+	if t.isParallel {
+		panic("testing: t.Setenv called after t.Parallel; cannot set environment variables in parallel tests")
+	}
+
+	t.isEnvSet = true
+
+	t.common.Setenv(key, value)
 }
 
 // InternalTest is an internal type but exported because it is cross-package;
@@ -940,10 +1135,17 @@ func tRunner(t *T, fn func(t *T)) {
 		// If the test panicked, print any test output before dying.
 		err := recover()
 		signal := true
-		if !t.finished && err == nil {
+
+		t.mu.RLock()
+		finished := t.finished
+		t.mu.RUnlock()
+		if !finished && err == nil {
 			err = errNilPanicOrGoexit
 			for p := t.parent; p != nil; p = p.parent {
-				if p.finished {
+				p.mu.RLock()
+				finished = p.finished
+				p.mu.RUnlock()
+				if finished {
 					t.Errorf("%v: subtest may have called FailNow on a parent test", err)
 					err = nil
 					signal = false
@@ -951,6 +1153,21 @@ func tRunner(t *T, fn func(t *T)) {
 				}
 			}
 		}
+		// Use a deferred call to ensure that we report that the test is
+		// complete even if a cleanup function calls t.FailNow. See issue 41355.
+		didPanic := false
+		defer func() {
+			if didPanic {
+				return
+			}
+			if err != nil {
+				panic(err)
+			}
+			// Only report that the test is complete if it doesn't panic,
+			// as otherwise the test binary can exit before the panic is
+			// reported to the user. See issue 41479.
+			t.signal <- signal
+		}()
 
 		doPanic := func(err interface{}) {
 			t.Fail()
@@ -963,11 +1180,12 @@ func tRunner(t *T, fn func(t *T)) {
 				root.duration += time.Since(root.start)
 				d := root.duration
 				root.mu.Unlock()
-				root.flushToParent("--- FAIL: %s (%s)\n", root.name, fmtDuration(d))
+				root.flushToParent(root.name, "--- FAIL: %s (%s)\n", root.name, fmtDuration(d))
 				if r := root.parent.runCleanup(recoverAndReturnPanic); r != nil {
 					fmt.Fprintf(root.parent.w, "cleanup panicked with %v", r)
 				}
 			}
+			didPanic = true
 			panic(err)
 		}
 		if err != nil {
@@ -1009,7 +1227,6 @@ func tRunner(t *T, fn func(t *T)) {
 		if t.parent != nil && atomic.LoadInt32(&t.hasSub) == 0 {
 			t.setRan()
 		}
-		t.signal <- signal
 	}()
 	defer func() {
 		if len(t.sub) == 0 {
@@ -1022,7 +1239,9 @@ func tRunner(t *T, fn func(t *T)) {
 	fn(t)
 
 	// code beyond here will not be executed when FailNow is invoked
+	t.mu.Lock()
 	t.finished = true
+	t.mu.Unlock()
 }
 
 // Run runs f as a subtest of t called name. It runs f in a separate goroutine
@@ -1045,7 +1264,7 @@ func (t *T) Run(name string, f func(t *T)) bool {
 	t = &T{
 		common: common{
 			barrier: make(chan bool),
-			signal:  make(chan bool),
+			signal:  make(chan bool, 1),
 			name:    testName,
 			parent:  &t.common,
 			level:   t.level + 1,
@@ -1056,14 +1275,8 @@ func (t *T) Run(name string, f func(t *T)) bool {
 	}
 	t.w = indenter{&t.common}
 
-	if t.chatty {
-		// Print directly to root's io.Writer so there is no delay.
-		root := t.parent
-		for ; root.parent != nil; root = root.parent {
-		}
-		root.mu.Lock()
-		fmt.Fprintf(root.w, "=== RUN   %s\n", t.name)
-		root.mu.Unlock()
+	if t.chatty != nil {
+		t.chatty.Updatef(t.name, "=== RUN   %s\n", t.name)
 	}
 	// Instead of reducing the running count of this test before calling the
 	// tRunner and increasing it afterwards, we rely on tRunner keeping the
@@ -1156,6 +1369,7 @@ func (f matchStringOnly) WriteProfileTo(string, io.Writer, int) error { return e
 func (f matchStringOnly) ImportPath() string                          { return "" }
 func (f matchStringOnly) StartTestLog(io.Writer)                      {}
 func (f matchStringOnly) StopTestLog() error                          { return errMain }
+func (f matchStringOnly) SetPanicOnExit0(bool)                        {}
 
 // Main is an internal function, part of the implementation of the "go test" command.
 // It was exported because it is cross-package and predates "internal" packages.
@@ -1191,6 +1405,7 @@ type M struct {
 type testDeps interface {
 	ImportPath() string
 	MatchString(pat, str string) (bool, error)
+	SetPanicOnExit0(bool)
 	StartCPUProfile(io.Writer) error
 	StopCPUProfile()
 	StartTestLog(io.Writer)
@@ -1271,12 +1486,12 @@ func (t *T) report() {
 	dstr := fmtDuration(t.duration)
 	format := "--- %s: %s (%s)\n"
 	if t.Failed() {
-		t.flushToParent(format, "FAIL", t.name, dstr)
-	} else if t.chatty {
+		t.flushToParent(t.name, format, "FAIL", t.name, dstr)
+	} else if t.chatty != nil {
 		if t.Skipped() {
-			t.flushToParent(format, "SKIP", t.name, dstr)
+			t.flushToParent(t.name, format, "SKIP", t.name, dstr)
 		} else {
-			t.flushToParent(format, "PASS", t.name, dstr)
+			t.flushToParent(t.name, format, "PASS", t.name, dstr)
 		}
 	}
 }
@@ -1330,22 +1545,25 @@ func runTests(matchString func(pat, str string) (bool, error), tests []InternalT
 			ctx.deadline = deadline
 			t := &T{
 				common: common{
-					signal:  make(chan bool),
+					signal:  make(chan bool, 1),
 					barrier: make(chan bool),
 					w:       os.Stdout,
-					chatty:  *chatty,
 				},
 				context: ctx,
+			}
+			if Verbose() {
+				t.chatty = newChattyPrinter(t.w)
 			}
 			tRunner(t, func(t *T) {
 				for _, test := range tests {
 					t.Run(test.Name, test.F)
 				}
-				// Run catching the signal rather than the tRunner as a separate
-				// goroutine to avoid adding a goroutine during the sequential
-				// phase as this pollutes the stacktrace output when aborting.
-				go func() { <-t.signal }()
 			})
+			select {
+			case <-t.signal:
+			default:
+				panic("internal error: tRunner exited without sending on t.signal")
+			}
 			ok = ok && !t.Failed()
 			ran = ran || t.ran
 		}
@@ -1414,6 +1632,9 @@ func (m *M) before() {
 		m.deps.StartTestLog(f)
 		testlogFile = f
 	}
+	if *panicOnExit0 {
+		m.deps.SetPanicOnExit0(true)
+	}
 }
 
 // after runs after all testing.
@@ -1421,6 +1642,13 @@ func (m *M) after() {
 	m.afterOnce.Do(func() {
 		m.writeProfiles()
 	})
+
+	// Restore PanicOnExit0 after every run, because we set it to true before
+	// every run. Otherwise, if m.Run is called multiple times the behavior of
+	// os.Exit(0) will not be restored after the second run.
+	if *panicOnExit0 {
+		m.deps.SetPanicOnExit0(false)
+	}
 }
 
 func (m *M) writeProfiles() {

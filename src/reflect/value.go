@@ -5,6 +5,9 @@
 package reflect
 
 import (
+	"internal/abi"
+	"internal/itoa"
+	"internal/unsafeheader"
 	"math"
 	"runtime"
 	"unsafe"
@@ -89,6 +92,7 @@ func (f flag) ro() flag {
 
 // pointer returns the underlying pointer represented by v.
 // v.Kind() must be Ptr, Map, Chan, Func, or UnsafePointer
+// if v.Kind() == Ptr, the base type must not be go:notinheap.
 func (v Value) pointer() unsafe.Pointer {
 	if v.typ.size != ptrSize || !v.typ.pointers() {
 		panic("can't call pointer on a non-pointer Value")
@@ -177,6 +181,17 @@ func methodName() string {
 	return f.Name()
 }
 
+// methodNameSkip is like methodName, but skips another stack frame.
+// This is a separate function so that reflect.flag.mustBe will be inlined.
+func methodNameSkip() string {
+	pc, _, _, _ := runtime.Caller(3)
+	f := runtime.FuncForPC(pc)
+	if f == nil {
+		return "unknown method"
+	}
+	return f.Name()
+}
+
 // emptyInterface is the header for an interface{} value.
 type emptyInterface struct {
 	typ  *rtype
@@ -219,10 +234,10 @@ func (f flag) mustBeExported() {
 
 func (f flag) mustBeExportedSlow() {
 	if f == 0 {
-		panic(&ValueError{methodName(), Invalid})
+		panic(&ValueError{methodNameSkip(), Invalid})
 	}
 	if f&flagRO != 0 {
-		panic("reflect: " + methodName() + " using value obtained using unexported field")
+		panic("reflect: " + methodNameSkip() + " using value obtained using unexported field")
 	}
 }
 
@@ -237,14 +252,14 @@ func (f flag) mustBeAssignable() {
 
 func (f flag) mustBeAssignableSlow() {
 	if f == 0 {
-		panic(&ValueError{methodName(), Invalid})
+		panic(&ValueError{methodNameSkip(), Invalid})
 	}
 	// Assignable if addressable and not read-only.
 	if f&flagRO != 0 {
-		panic("reflect: " + methodName() + " using value obtained using unexported field")
+		panic("reflect: " + methodNameSkip() + " using value obtained using unexported field")
 	}
 	if f&flagAddr == 0 {
-		panic("reflect: " + methodName() + " using unaddressable value")
+		panic("reflect: " + methodNameSkip() + " using unaddressable value")
 	}
 }
 
@@ -257,7 +272,10 @@ func (v Value) Addr() Value {
 	if v.flag&flagAddr == 0 {
 		panic("reflect.Value.Addr of unaddressable value")
 	}
-	return Value{v.typ.ptrTo(), v.ptr, v.flag.ro() | flag(Ptr)}
+	// Preserve flagRO instead of using v.flag.ro() so that
+	// v.Addr().Elem() is equivalent to v (#32772)
+	fl := v.flag & flagRO
+	return Value{v.typ.ptrTo(), v.ptr, fl | flag(Ptr)}
 }
 
 // Bool returns v's underlying value.
@@ -336,6 +354,8 @@ func (v Value) CallSlice(in []Value) []Value {
 
 var callGC bool // for testing; see TestCallMethodJump
 
+const debugReflectCall = false
+
 func (v Value) call(op string, in []Value) []Value {
 	// Get function pointer, type.
 	t := (*funcType)(unsafe.Pointer(v.typ))
@@ -359,8 +379,9 @@ func (v Value) call(op string, in []Value) []Value {
 
 	isSlice := op == "CallSlice"
 	n := t.NumIn()
+	isVariadic := t.IsVariadic()
 	if isSlice {
-		if !t.IsVariadic() {
+		if !isVariadic {
 			panic("reflect: CallSlice of non-variadic function")
 		}
 		if len(in) < n {
@@ -370,13 +391,13 @@ func (v Value) call(op string, in []Value) []Value {
 			panic("reflect: CallSlice with too many input arguments")
 		}
 	} else {
-		if t.IsVariadic() {
+		if isVariadic {
 			n--
 		}
 		if len(in) < n {
 			panic("reflect: Call with too few input arguments")
 		}
-		if !t.IsVariadic() && len(in) > n {
+		if !isVariadic && len(in) > n {
 			panic("reflect: Call with too many input arguments")
 		}
 	}
@@ -390,7 +411,7 @@ func (v Value) call(op string, in []Value) []Value {
 			panic("reflect: " + op + " using " + xt.String() + " as type " + targ.String())
 		}
 	}
-	if !isSlice && t.IsVariadic() {
+	if !isSlice && isVariadic {
 		// prepare slice for remaining values
 		m := len(in) - n
 		slice := MakeSlice(t.In(n), m, m)
@@ -414,50 +435,112 @@ func (v Value) call(op string, in []Value) []Value {
 	}
 	nout := t.NumOut()
 
-	// Compute frame type.
-	frametype, _, retOffset, _, framePool := funcLayout(t, rcvrtype)
+	// Register argument space.
+	var regArgs abi.RegArgs
 
-	// Allocate a chunk of memory for frame.
-	var args unsafe.Pointer
-	if nout == 0 {
-		args = framePool.Get().(unsafe.Pointer)
-	} else {
-		// Can't use pool if the function has return values.
-		// We will leak pointer to args in ret, so its lifetime is not scoped.
-		args = unsafe_New(frametype)
+	// Compute frame type.
+	frametype, framePool, abi := funcLayout(t, rcvrtype)
+
+	// Allocate a chunk of memory for frame if needed.
+	var stackArgs unsafe.Pointer
+	if frametype.size != 0 {
+		if nout == 0 {
+			stackArgs = framePool.Get().(unsafe.Pointer)
+		} else {
+			// Can't use pool if the function has return values.
+			// We will leak pointer to args in ret, so its lifetime is not scoped.
+			stackArgs = unsafe_New(frametype)
+		}
 	}
-	off := uintptr(0)
+	frameSize := frametype.size
+
+	if debugReflectCall {
+		println("reflect.call", t.String())
+		abi.dump()
+	}
 
 	// Copy inputs into args.
+
+	// Handle receiver.
+	inStart := 0
 	if rcvrtype != nil {
-		storeRcvr(rcvr, args)
-		off = ptrSize
+		// Guaranteed to only be one word in size,
+		// so it will only take up exactly 1 abiStep (either
+		// in a register or on the stack).
+		switch st := abi.call.steps[0]; st.kind {
+		case abiStepStack:
+			storeRcvr(rcvr, stackArgs)
+		case abiStepIntReg, abiStepPointer:
+			// Even pointers can go into the uintptr slot because
+			// they'll be kept alive by the Values referenced by
+			// this frame. Reflection forces these to be heap-allocated,
+			// so we don't need to worry about stack copying.
+			storeRcvr(rcvr, unsafe.Pointer(&regArgs.Ints[st.ireg]))
+		case abiStepFloatReg:
+			storeRcvr(rcvr, unsafe.Pointer(&regArgs.Floats[st.freg]))
+		default:
+			panic("unknown ABI parameter kind")
+		}
+		inStart = 1
 	}
+
+	// Handle arguments.
 	for i, v := range in {
 		v.mustBeExported()
 		targ := t.In(i).(*rtype)
-		a := uintptr(targ.align)
-		off = (off + a - 1) &^ (a - 1)
-		n := targ.size
-		if n == 0 {
-			// Not safe to compute args+off pointing at 0 bytes,
-			// because that might point beyond the end of the frame,
-			// but we still need to call assignTo to check assignability.
-			v.assignTo("reflect.Value.Call", targ, nil)
-			continue
+		// TODO(mknyszek): Figure out if it's possible to get some
+		// scratch space for this assignment check. Previously, it
+		// was possible to use space in the argument frame.
+		v = v.assignTo("reflect.Value.Call", targ, nil)
+	stepsLoop:
+		for _, st := range abi.call.stepsForValue(i + inStart) {
+			switch st.kind {
+			case abiStepStack:
+				// Copy values to the "stack."
+				addr := add(stackArgs, st.stkOff, "precomputed stack arg offset")
+				if v.flag&flagIndir != 0 {
+					typedmemmove(targ, addr, v.ptr)
+				} else {
+					*(*unsafe.Pointer)(addr) = v.ptr
+				}
+				// There's only one step for a stack-allocated value.
+				break stepsLoop
+			case abiStepIntReg, abiStepPointer:
+				// Copy values to "integer registers."
+				if v.flag&flagIndir != 0 {
+					offset := add(v.ptr, st.offset, "precomputed value offset")
+					memmove(unsafe.Pointer(&regArgs.Ints[st.ireg]), offset, st.size)
+				} else {
+					if st.kind == abiStepPointer {
+						// Duplicate this pointer in the pointer area of the
+						// register space. Otherwise, there's the potential for
+						// this to be the last reference to v.ptr.
+						regArgs.Ptrs[st.ireg] = v.ptr
+					}
+					regArgs.Ints[st.ireg] = uintptr(v.ptr)
+				}
+			case abiStepFloatReg:
+				// Copy values to "float registers."
+				if v.flag&flagIndir == 0 {
+					panic("attempted to copy pointer to FP register")
+				}
+				offset := add(v.ptr, st.offset, "precomputed value offset")
+				memmove(unsafe.Pointer(&regArgs.Floats[st.freg]), offset, st.size)
+			default:
+				panic("unknown ABI part kind")
+			}
 		}
-		addr := add(args, off, "n > 0")
-		v = v.assignTo("reflect.Value.Call", targ, addr)
-		if v.flag&flagIndir != 0 {
-			typedmemmove(targ, addr, v.ptr)
-		} else {
-			*(*unsafe.Pointer)(addr) = v.ptr
-		}
-		off += n
 	}
+	// TODO(mknyszek): Remove this when we no longer have
+	// caller reserved spill space.
+	frameSize = align(frameSize, ptrSize)
+	frameSize += abi.spill
+
+	// Mark pointers in registers for the return path.
+	regArgs.ReturnIsPtr = abi.outRegPtrs
 
 	// Call.
-	call(frametype, fn, args, uint32(frametype.size), uint32(retOffset))
+	call(frametype, fn, stackArgs, uint32(frametype.size), uint32(abi.retOffset), uint32(frameSize), &regArgs)
 
 	// For testing; see TestCallMethodJump.
 	if callGC {
@@ -466,34 +549,82 @@ func (v Value) call(op string, in []Value) []Value {
 
 	var ret []Value
 	if nout == 0 {
-		typedmemclr(frametype, args)
-		framePool.Put(args)
+		if stackArgs != nil {
+			typedmemclr(frametype, stackArgs)
+			framePool.Put(stackArgs)
+		}
 	} else {
-		// Zero the now unused input area of args,
-		// because the Values returned by this function contain pointers to the args object,
-		// and will thus keep the args object alive indefinitely.
-		typedmemclrpartial(frametype, args, 0, retOffset)
+		if stackArgs != nil {
+			// Zero the now unused input area of args,
+			// because the Values returned by this function contain pointers to the args object,
+			// and will thus keep the args object alive indefinitely.
+			typedmemclrpartial(frametype, stackArgs, 0, abi.retOffset)
+		}
 
 		// Wrap Values around return values in args.
 		ret = make([]Value, nout)
-		off = retOffset
 		for i := 0; i < nout; i++ {
 			tv := t.Out(i)
-			a := uintptr(tv.Align())
-			off = (off + a - 1) &^ (a - 1)
-			if tv.Size() != 0 {
+			if tv.Size() == 0 {
+				// For zero-sized return value, args+off may point to the next object.
+				// In this case, return the zero value instead.
+				ret[i] = Zero(tv)
+				continue
+			}
+			steps := abi.ret.stepsForValue(i)
+			if st := steps[0]; st.kind == abiStepStack {
+				// This value is on the stack. If part of a value is stack
+				// allocated, the entire value is according to the ABI. So
+				// just make an indirection into the allocated frame.
 				fl := flagIndir | flag(tv.Kind())
-				ret[i] = Value{tv.common(), add(args, off, "tv.Size() != 0"), fl}
+				ret[i] = Value{tv.common(), add(stackArgs, st.stkOff, "tv.Size() != 0"), fl}
 				// Note: this does introduce false sharing between results -
 				// if any result is live, they are all live.
 				// (And the space for the args is live as well, but as we've
 				// cleared that space it isn't as big a deal.)
-			} else {
-				// For zero-sized return value, args+off may point to the next object.
-				// In this case, return the zero value instead.
-				ret[i] = Zero(tv)
+				continue
 			}
-			off += tv.Size()
+
+			// Handle pointers passed in registers.
+			if !ifaceIndir(tv.common()) {
+				// Pointer-valued data gets put directly
+				// into v.ptr.
+				if steps[0].kind != abiStepPointer {
+					print("kind=", steps[0].kind, ", type=", tv.String(), "\n")
+					panic("mismatch between ABI description and types")
+				}
+				ret[i] = Value{tv.common(), regArgs.Ptrs[steps[0].ireg], flag(tv.Kind())}
+				continue
+			}
+
+			// All that's left is values passed in registers that we need to
+			// create space for and copy values back into.
+			//
+			// TODO(mknyszek): We make a new allocation for each register-allocated
+			// value, but previously we could always point into the heap-allocated
+			// stack frame. This is a regression that could be fixed by adding
+			// additional space to the allocated stack frame and storing the
+			// register-allocated return values into the allocated stack frame and
+			// referring there in the resulting Value.
+			s := unsafe_New(tv.common())
+			for _, st := range steps {
+				switch st.kind {
+				case abiStepIntReg:
+					offset := add(s, st.offset, "precomputed value offset")
+					memmove(offset, unsafe.Pointer(&regArgs.Ints[st.ireg]), st.size)
+				case abiStepPointer:
+					s := add(s, st.offset, "precomputed value offset")
+					*((*unsafe.Pointer)(s)) = regArgs.Ptrs[st.ireg]
+				case abiStepFloatReg:
+					offset := add(s, st.offset, "precomputed value offset")
+					memmove(offset, unsafe.Pointer(&regArgs.Floats[st.freg]), st.size)
+				case abiStepStack:
+					panic("register-based return value has stack component")
+				default:
+					panic("unknown ABI part kind")
+				}
+			}
+			ret[i] = Value{tv.common(), s, flagIndir | flag(tv.Kind())}
 		}
 	}
 
@@ -517,32 +648,81 @@ func (v Value) call(op string, in []Value) []Value {
 // frame is a pointer to the arguments to that closure on the stack.
 // retValid points to a boolean which should be set when the results
 // section of frame is set.
-func callReflect(ctxt *makeFuncImpl, frame unsafe.Pointer, retValid *bool) {
+//
+// regs contains the argument values passed in registers and will contain
+// the values returned from ctxt.fn in registers.
+func callReflect(ctxt *makeFuncImpl, frame unsafe.Pointer, retValid *bool, regs *abi.RegArgs) {
+	if callGC {
+		// Call GC upon entry during testing.
+		// Getting our stack scanned here is the biggest hazard, because
+		// our caller (makeFuncStub) could have failed to place the last
+		// pointer to a value in regs' pointer space, in which case it
+		// won't be visible to the GC.
+		runtime.GC()
+	}
 	ftyp := ctxt.ftyp
 	f := ctxt.fn
 
-	// Copy argument frame into Values.
+	_, _, abi := funcLayout(ftyp, nil)
+
+	// Copy arguments into Values.
 	ptr := frame
-	off := uintptr(0)
 	in := make([]Value, 0, int(ftyp.inCount))
-	for _, typ := range ftyp.in() {
-		off += -off & uintptr(typ.align-1)
+	for i, typ := range ftyp.in() {
+		if typ.Size() == 0 {
+			in = append(in, Zero(typ))
+			continue
+		}
 		v := Value{typ, nil, flag(typ.Kind())}
-		if ifaceIndir(typ) {
-			// value cannot be inlined in interface data.
-			// Must make a copy, because f might keep a reference to it,
-			// and we cannot let f keep a reference to the stack frame
-			// after this function returns, not even a read-only reference.
-			v.ptr = unsafe_New(typ)
-			if typ.size > 0 {
-				typedmemmove(typ, v.ptr, add(ptr, off, "typ.size > 0"))
+		steps := abi.call.stepsForValue(i)
+		if st := steps[0]; st.kind == abiStepStack {
+			if ifaceIndir(typ) {
+				// value cannot be inlined in interface data.
+				// Must make a copy, because f might keep a reference to it,
+				// and we cannot let f keep a reference to the stack frame
+				// after this function returns, not even a read-only reference.
+				v.ptr = unsafe_New(typ)
+				if typ.size > 0 {
+					typedmemmove(typ, v.ptr, add(ptr, st.stkOff, "typ.size > 0"))
+				}
+				v.flag |= flagIndir
+			} else {
+				v.ptr = *(*unsafe.Pointer)(add(ptr, st.stkOff, "1-ptr"))
 			}
-			v.flag |= flagIndir
 		} else {
-			v.ptr = *(*unsafe.Pointer)(add(ptr, off, "1-ptr"))
+			if ifaceIndir(typ) {
+				// All that's left is values passed in registers that we need to
+				// create space for the values.
+				v.flag |= flagIndir
+				v.ptr = unsafe_New(typ)
+				for _, st := range steps {
+					switch st.kind {
+					case abiStepIntReg:
+						offset := add(v.ptr, st.offset, "precomputed value offset")
+						memmove(offset, unsafe.Pointer(&regs.Ints[st.ireg]), st.size)
+					case abiStepPointer:
+						s := add(v.ptr, st.offset, "precomputed value offset")
+						*((*unsafe.Pointer)(s)) = regs.Ptrs[st.ireg]
+					case abiStepFloatReg:
+						offset := add(v.ptr, st.offset, "precomputed value offset")
+						memmove(offset, unsafe.Pointer(&regs.Floats[st.freg]), st.size)
+					case abiStepStack:
+						panic("register-based return value has stack component")
+					default:
+						panic("unknown ABI part kind")
+					}
+				}
+			} else {
+				// Pointer-valued data gets put directly
+				// into v.ptr.
+				if steps[0].kind != abiStepPointer {
+					print("kind=", steps[0].kind, ", type=", typ.String(), "\n")
+					panic("mismatch between ABI description and types")
+				}
+				v.ptr = regs.Ptrs[steps[0].ireg]
+			}
 		}
 		in = append(in, v)
-		off += typ.size
 	}
 
 	// Call underlying function.
@@ -552,9 +732,8 @@ func callReflect(ctxt *makeFuncImpl, frame unsafe.Pointer, retValid *bool) {
 		panic("reflect: wrong return count from function created by MakeFunc")
 	}
 
-	// Copy results back into argument frame.
+	// Copy results back into argument frame and register space.
 	if numOut > 0 {
-		off += -off & (ptrSize - 1)
 		for i, typ := range ftyp.out() {
 			v := out[i]
 			if v.typ == nil {
@@ -565,24 +744,67 @@ func callReflect(ctxt *makeFuncImpl, frame unsafe.Pointer, retValid *bool) {
 				panic("reflect: function created by MakeFunc using " + funcName(f) +
 					" returned value obtained from unexported field")
 			}
-			off += -off & uintptr(typ.align-1)
 			if typ.size == 0 {
 				continue
 			}
-			addr := add(ptr, off, "typ.size > 0")
 
 			// Convert v to type typ if v is assignable to a variable
 			// of type t in the language spec.
 			// See issue 28761.
-			v = v.assignTo("reflect.MakeFunc", typ, addr)
-
-			// We are writing to stack. No write barrier.
-			if v.flag&flagIndir != 0 {
-				memmove(addr, v.ptr, typ.size)
-			} else {
-				*(*uintptr)(addr) = uintptr(v.ptr)
+			//
+			//
+			// TODO(mknyszek): In the switch to the register ABI we lost
+			// the scratch space here for the register cases (and
+			// temporarily for all the cases).
+			//
+			// If/when this happens, take note of the following:
+			//
+			// We must clear the destination before calling assignTo,
+			// in case assignTo writes (with memory barriers) to the
+			// target location used as scratch space. See issue 39541.
+			v = v.assignTo("reflect.MakeFunc", typ, nil)
+		stepsLoop:
+			for _, st := range abi.ret.stepsForValue(i) {
+				switch st.kind {
+				case abiStepStack:
+					// Copy values to the "stack."
+					addr := add(ptr, st.stkOff, "precomputed stack arg offset")
+					// Do not use write barriers. The stack space used
+					// for this call is not adequately zeroed, and we
+					// are careful to keep the arguments alive until we
+					// return to makeFuncStub's caller.
+					if v.flag&flagIndir != 0 {
+						memmove(addr, v.ptr, st.size)
+					} else {
+						// This case must be a pointer type.
+						*(*uintptr)(addr) = uintptr(v.ptr)
+					}
+					// There's only one step for a stack-allocated value.
+					break stepsLoop
+				case abiStepIntReg, abiStepPointer:
+					// Copy values to "integer registers."
+					if v.flag&flagIndir != 0 {
+						offset := add(v.ptr, st.offset, "precomputed value offset")
+						memmove(unsafe.Pointer(&regs.Ints[st.ireg]), offset, st.size)
+					} else {
+						// Only populate the Ints space on the return path.
+						// This is safe because out is kept alive until the
+						// end of this function, and the return path through
+						// makeFuncStub has no preemption, so these pointers
+						// are always visible to the GC.
+						regs.Ints[st.ireg] = uintptr(v.ptr)
+					}
+				case abiStepFloatReg:
+					// Copy values to "float registers."
+					if v.flag&flagIndir == 0 {
+						panic("attempted to copy pointer to FP register")
+					}
+					offset := add(v.ptr, st.offset, "precomputed value offset")
+					memmove(unsafe.Pointer(&regs.Floats[st.freg]), offset, st.size)
+				default:
+					panic("unknown ABI part kind")
+				}
 			}
-			off += typ.size
 		}
 	}
 
@@ -683,41 +905,150 @@ func align(x, n uintptr) uintptr {
 // frame is a pointer to the arguments to that closure on the stack.
 // retValid points to a boolean which should be set when the results
 // section of frame is set.
-func callMethod(ctxt *methodValue, frame unsafe.Pointer, retValid *bool) {
+//
+// regs contains the argument values passed in registers and will contain
+// the values returned from ctxt.fn in registers.
+func callMethod(ctxt *methodValue, frame unsafe.Pointer, retValid *bool, regs *abi.RegArgs) {
 	rcvr := ctxt.rcvr
-	rcvrtype, t, fn := methodReceiver("call", rcvr, ctxt.method)
-	frametype, argSize, retOffset, _, framePool := funcLayout(t, rcvrtype)
+	rcvrType, valueFuncType, methodFn := methodReceiver("call", rcvr, ctxt.method)
+
+	// There are two ABIs at play here.
+	//
+	// methodValueCall was invoked with the ABI assuming there was no
+	// receiver ("value ABI") and that's what frame and regs are holding.
+	//
+	// Meanwhile, we need to actually call the method with a receiver, which
+	// has its own ABI ("method ABI"). Everything that follows is a translation
+	// between the two.
+	_, _, valueABI := funcLayout(valueFuncType, nil)
+	valueFrame, valueRegs := frame, regs
+	methodFrameType, methodFramePool, methodABI := funcLayout(valueFuncType, rcvrType)
 
 	// Make a new frame that is one word bigger so we can store the receiver.
 	// This space is used for both arguments and return values.
-	scratch := framePool.Get().(unsafe.Pointer)
+	methodFrame := methodFramePool.Get().(unsafe.Pointer)
+	var methodRegs abi.RegArgs
 
-	// Copy in receiver and rest of args.
-	storeRcvr(rcvr, scratch)
-	// Align the first arg. The alignment can't be larger than ptrSize.
-	argOffset := uintptr(ptrSize)
-	if len(t.in()) > 0 {
-		argOffset = align(argOffset, uintptr(t.in()[0].align))
+	// Deal with the receiver. It's guaranteed to only be one word in size.
+	if st := methodABI.call.steps[0]; st.kind == abiStepStack {
+		// Only copy the reciever to the stack if the ABI says so.
+		// Otherwise, it'll be in a register already.
+		storeRcvr(rcvr, methodFrame)
+	} else {
+		// Put the receiver in a register.
+		storeRcvr(rcvr, unsafe.Pointer(&methodRegs.Ints))
 	}
-	// Avoid constructing out-of-bounds pointers if there are no args.
-	if argSize-argOffset > 0 {
-		typedmemmovepartial(frametype, add(scratch, argOffset, "argSize > argOffset"), frame, argOffset, argSize-argOffset)
+
+	// Translate the rest of the arguments.
+	for i, t := range valueFuncType.in() {
+		valueSteps := valueABI.call.stepsForValue(i)
+		methodSteps := methodABI.call.stepsForValue(i + 1)
+
+		// Zero-sized types are trivial: nothing to do.
+		if len(valueSteps) == 0 {
+			if len(methodSteps) != 0 {
+				panic("method ABI and value ABI do not align")
+			}
+			continue
+		}
+
+		// There are three cases to handle in translating each
+		// argument:
+		// 1. Stack -> stack translation.
+		// 2. Registers -> stack translation.
+		// 3. Registers -> registers translation.
+		// The fourth cases can't happen, because a method value
+		// call uses strictly fewer registers than a method call.
+
+		// If the value ABI passes the value on the stack,
+		// then the method ABI does too, because it has strictly
+		// fewer arguments. Simply copy between the two.
+		if vStep := valueSteps[0]; vStep.kind == abiStepStack {
+			mStep := methodSteps[0]
+			if mStep.kind != abiStepStack || vStep.size != mStep.size {
+				panic("method ABI and value ABI do not align")
+			}
+			typedmemmove(t,
+				add(methodFrame, mStep.stkOff, "precomputed stack offset"),
+				add(valueFrame, vStep.stkOff, "precomputed stack offset"))
+			continue
+		}
+		// Handle register -> stack translation.
+		if mStep := methodSteps[0]; mStep.kind == abiStepStack {
+			for _, vStep := range valueSteps {
+				to := add(methodFrame, mStep.stkOff+vStep.offset, "precomputed stack offset")
+				switch vStep.kind {
+				case abiStepPointer:
+					// Do the pointer copy directly so we get a write barrier.
+					*(*unsafe.Pointer)(to) = valueRegs.Ptrs[vStep.ireg]
+				case abiStepIntReg:
+					memmove(to, unsafe.Pointer(&valueRegs.Ints[vStep.ireg]), vStep.size)
+				case abiStepFloatReg:
+					memmove(to, unsafe.Pointer(&valueRegs.Floats[vStep.freg]), vStep.size)
+				default:
+					panic("unexpected value step")
+				}
+			}
+			continue
+		}
+		// Handle register -> register translation.
+		if len(valueSteps) != len(methodSteps) {
+			// Because it's the same type for the value, and it's assigned
+			// to registers both times, it should always take up the same
+			// number of registers for each ABI.
+			panic("method ABI and value ABI don't align")
+		}
+		for i, vStep := range valueSteps {
+			mStep := methodSteps[i]
+			if mStep.kind != vStep.kind {
+				panic("method ABI and value ABI don't align")
+			}
+			switch vStep.kind {
+			case abiStepPointer:
+				// Copy this too, so we get a write barrier.
+				methodRegs.Ptrs[mStep.ireg] = valueRegs.Ptrs[vStep.ireg]
+				fallthrough
+			case abiStepIntReg:
+				methodRegs.Ints[mStep.ireg] = valueRegs.Ints[vStep.ireg]
+			case abiStepFloatReg:
+				methodRegs.Floats[mStep.freg] = valueRegs.Floats[vStep.freg]
+			default:
+				panic("unexpected value step")
+			}
+		}
 	}
+
+	methodFrameSize := methodFrameType.size
+	// TODO(mknyszek): Remove this when we no longer have
+	// caller reserved spill space.
+	methodFrameSize = align(methodFrameSize, ptrSize)
+	methodFrameSize += methodABI.spill
+
+	// Mark pointers in registers for the return path.
+	methodRegs.ReturnIsPtr = methodABI.outRegPtrs
 
 	// Call.
 	// Call copies the arguments from scratch to the stack, calls fn,
 	// and then copies the results back into scratch.
-	call(frametype, fn, scratch, uint32(frametype.size), uint32(retOffset))
+	call(methodFrameType, methodFn, methodFrame, uint32(methodFrameType.size), uint32(methodABI.retOffset), uint32(methodFrameSize), &methodRegs)
 
 	// Copy return values.
-	// Ignore any changes to args and just copy return values.
+	//
+	// This is somewhat simpler because both ABIs have an identical
+	// return value ABI (the types are identical). As a result, register
+	// results can simply be copied over. Stack-allocated values are laid
+	// out the same, but are at different offsets from the start of the frame
+	// Ignore any changes to args.
 	// Avoid constructing out-of-bounds pointers if there are no return values.
-	if frametype.size-retOffset > 0 {
-		callerRetOffset := retOffset - argOffset
+	// because the arguments may be laid out differently.
+	if valueRegs != nil {
+		*valueRegs = methodRegs
+	}
+	if retSize := methodFrameType.size - methodABI.retOffset; retSize > 0 {
+		valueRet := add(valueFrame, valueABI.retOffset, "valueFrame's size > retOffset")
+		methodRet := add(methodFrame, methodABI.retOffset, "methodFrame's size > retOffset")
 		// This copies to the stack. Write barriers are not needed.
-		memmove(add(frame, callerRetOffset, "frametype.size > retOffset"),
-			add(scratch, retOffset, "frametype.size > retOffset"),
-			frametype.size-retOffset)
+		memmove(valueRet, methodRet, retSize)
 	}
 
 	// Tell the runtime it can now depend on the return values
@@ -727,11 +1058,16 @@ func callMethod(ctxt *methodValue, frame unsafe.Pointer, retValid *bool) {
 	// Clear the scratch space and put it back in the pool.
 	// This must happen after the statement above, so that the return
 	// values will always be scanned by someone.
-	typedmemclr(frametype, scratch)
-	framePool.Put(scratch)
+	typedmemclr(methodFrameType, methodFrame)
+	methodFramePool.Put(methodFrame)
 
 	// See the comment in callReflect.
 	runtime.KeepAlive(ctxt)
+
+	// Keep valueRegs alive because it may hold live pointer results.
+	// The caller (methodValueCall) has it as a stack object, which is only
+	// scanned when there is a reference to it.
+	runtime.KeepAlive(valueRegs)
 }
 
 // funcName returns the name of f, for use in error messages.
@@ -755,7 +1091,7 @@ func (v Value) Cap() int {
 		return chancap(v.pointer())
 	case Slice:
 		// Slice is always bigger than a word; assume flagIndir.
-		return (*sliceHeader)(v.ptr).Cap
+		return (*unsafeheader.Slice)(v.ptr).Cap
 	}
 	panic(&ValueError{"reflect.Value.Cap", v.kind()})
 }
@@ -934,7 +1270,7 @@ func (v Value) Index(i int) Value {
 	case Slice:
 		// Element flag same as Elem of Ptr.
 		// Addressable, indirect, possibly read-only.
-		s := (*sliceHeader)(v.ptr)
+		s := (*unsafeheader.Slice)(v.ptr)
 		if uint(i) >= uint(s.Len) {
 			panic("reflect: slice index out of range")
 		}
@@ -945,7 +1281,7 @@ func (v Value) Index(i int) Value {
 		return Value{typ, val, fl}
 
 	case String:
-		s := (*stringHeader)(v.ptr)
+		s := (*unsafeheader.String)(v.ptr)
 		if uint(i) >= uint(s.Len) {
 			panic("reflect: string index out of range")
 		}
@@ -1132,10 +1468,10 @@ func (v Value) Len() int {
 		return maplen(v.pointer())
 	case Slice:
 		// Slice is bigger than a word; assume flagIndir.
-		return (*sliceHeader)(v.ptr).Len
+		return (*unsafeheader.Slice)(v.ptr).Len
 	case String:
 		// String is bigger than a word; assume flagIndir.
-		return (*stringHeader)(v.ptr).Len
+		return (*unsafeheader.String)(v.ptr).Len
 	}
 	panic(&ValueError{"reflect.Value.Len", v.kind()})
 }
@@ -1304,7 +1640,7 @@ func (v Value) Method(i int) Value {
 	if v.typ.Kind() == Interface && v.IsNil() {
 		panic("reflect: Method on nil interface value")
 	}
-	fl := v.flag & (flagStickyRO | flagIndir) // Clear flagEmbedRO
+	fl := v.flag.ro() | (v.flag & flagIndir)
 	fl |= flag(Func)
 	fl |= flag(i)<<flagMethodShift | flagMethod
 	return Value{v.typ, v.ptr, fl}
@@ -1430,7 +1766,16 @@ func (v Value) Pointer() uintptr {
 	// TODO: deprecate
 	k := v.kind()
 	switch k {
-	case Chan, Map, Ptr, UnsafePointer:
+	case Ptr:
+		if v.typ.ptrdata == 0 {
+			// Handle pointers to go:notinheap types directly,
+			// so we never materialize such pointers as an
+			// unsafe.Pointer. (Such pointers are always indirect.)
+			// See issue 42076.
+			return *(*uintptr)(v.ptr)
+		}
+		fallthrough
+	case Chan, Map, UnsafePointer:
 		return uintptr(v.pointer())
 	case Func:
 		if v.flag&flagMethod != 0 {
@@ -1531,7 +1876,11 @@ func (v Value) Set(x Value) {
 	}
 	x = x.assignTo("reflect.Set", v.typ, target)
 	if x.flag&flagIndir != 0 {
-		typedmemmove(v.typ, v.ptr, x.ptr)
+		if x.ptr == unsafe.Pointer(&zeroVal[0]) {
+			typedmemclr(v.typ, v.ptr)
+		} else {
+			typedmemmove(v.typ, v.ptr, x.ptr)
+		}
 	} else {
 		*(*unsafe.Pointer)(v.ptr) = x.ptr
 	}
@@ -1621,7 +1970,7 @@ func (v Value) SetInt(x int64) {
 func (v Value) SetLen(n int) {
 	v.mustBeAssignable()
 	v.mustBe(Slice)
-	s := (*sliceHeader)(v.ptr)
+	s := (*unsafeheader.Slice)(v.ptr)
 	if uint(n) > uint(s.Cap) {
 		panic("reflect: slice length out of range in SetLen")
 	}
@@ -1634,7 +1983,7 @@ func (v Value) SetLen(n int) {
 func (v Value) SetCap(n int) {
 	v.mustBeAssignable()
 	v.mustBe(Slice)
-	s := (*sliceHeader)(v.ptr)
+	s := (*unsafeheader.Slice)(v.ptr)
 	if n < s.Len || n > s.Cap {
 		panic("reflect: slice capacity out of range in SetCap")
 	}
@@ -1736,18 +2085,18 @@ func (v Value) Slice(i, j int) Value {
 
 	case Slice:
 		typ = (*sliceType)(unsafe.Pointer(v.typ))
-		s := (*sliceHeader)(v.ptr)
+		s := (*unsafeheader.Slice)(v.ptr)
 		base = s.Data
 		cap = s.Cap
 
 	case String:
-		s := (*stringHeader)(v.ptr)
+		s := (*unsafeheader.String)(v.ptr)
 		if i < 0 || j < i || j > s.Len {
 			panic("reflect.Value.Slice: string slice index out of bounds")
 		}
-		var t stringHeader
+		var t unsafeheader.String
 		if i < s.Len {
-			t = stringHeader{arrayAt(s.Data, i, 1, "i < s.Len"), j - i}
+			t = unsafeheader.String{Data: arrayAt(s.Data, i, 1, "i < s.Len"), Len: j - i}
 		}
 		return Value{v.typ, unsafe.Pointer(&t), v.flag}
 	}
@@ -1759,8 +2108,8 @@ func (v Value) Slice(i, j int) Value {
 	// Declare slice so that gc can see the base pointer in it.
 	var x []unsafe.Pointer
 
-	// Reinterpret as *sliceHeader to edit.
-	s := (*sliceHeader)(unsafe.Pointer(&x))
+	// Reinterpret as *unsafeheader.Slice to edit.
+	s := (*unsafeheader.Slice)(unsafe.Pointer(&x))
 	s.Len = j - i
 	s.Cap = cap - i
 	if cap-i > 0 {
@@ -1798,7 +2147,7 @@ func (v Value) Slice3(i, j, k int) Value {
 
 	case Slice:
 		typ = (*sliceType)(unsafe.Pointer(v.typ))
-		s := (*sliceHeader)(v.ptr)
+		s := (*unsafeheader.Slice)(v.ptr)
 		base = s.Data
 		cap = s.Cap
 	}
@@ -1811,8 +2160,8 @@ func (v Value) Slice3(i, j, k int) Value {
 	// can see the base pointer in it.
 	var x []unsafe.Pointer
 
-	// Reinterpret as *sliceHeader to edit.
-	s := (*sliceHeader)(unsafe.Pointer(&x))
+	// Reinterpret as *unsafeheader.Slice to edit.
+	s := (*unsafeheader.Slice)(unsafe.Pointer(&x))
 	s.Len = j - i
 	s.Cap = k - i
 	if k-i > 0 {
@@ -1949,12 +2298,6 @@ type StringHeader struct {
 	Len  int
 }
 
-// stringHeader is a safe version of StringHeader used within this package.
-type stringHeader struct {
-	Data unsafe.Pointer
-	Len  int
-}
-
 // SliceHeader is the runtime representation of a slice.
 // It cannot be used safely or portably and its representation may
 // change in a later release.
@@ -1963,13 +2306,6 @@ type stringHeader struct {
 // a separate, correctly typed pointer to the underlying data.
 type SliceHeader struct {
 	Data uintptr
-	Len  int
-	Cap  int
-}
-
-// sliceHeader is a safe version of SliceHeader used within this package.
-type sliceHeader struct {
-	Data unsafe.Pointer
 	Len  int
 	Cap  int
 }
@@ -2074,22 +2410,22 @@ func Copy(dst, src Value) int {
 		typesMustMatch("reflect.Copy", de, se)
 	}
 
-	var ds, ss sliceHeader
+	var ds, ss unsafeheader.Slice
 	if dk == Array {
 		ds.Data = dst.ptr
 		ds.Len = dst.Len()
 		ds.Cap = ds.Len
 	} else {
-		ds = *(*sliceHeader)(dst.ptr)
+		ds = *(*unsafeheader.Slice)(dst.ptr)
 	}
 	if sk == Array {
 		ss.Data = src.ptr
 		ss.Len = src.Len()
 		ss.Cap = ss.Len
 	} else if sk == Slice {
-		ss = *(*sliceHeader)(src.ptr)
+		ss = *(*unsafeheader.Slice)(src.ptr)
 	} else {
-		sh := *(*stringHeader)(src.ptr)
+		sh := *(*unsafeheader.String)(src.ptr)
 		ss.Data = sh.Data
 		ss.Len = sh.Len
 		ss.Cap = sh.Len
@@ -2164,7 +2500,15 @@ func Select(cases []SelectCase) (chosen int, recv Value, recvOK bool) {
 	// NOTE: Do not trust that caller is not modifying cases data underfoot.
 	// The range is safe because the caller cannot modify our copy of the len
 	// and each iteration makes its own copy of the value c.
-	runcases := make([]runtimeSelect, len(cases))
+	var runcases []runtimeSelect
+	if len(cases) > 4 {
+		// Slice is heap allocated due to runtime dependent capacity.
+		runcases = make([]runtimeSelect, len(cases))
+	} else {
+		// Slice can be stack allocated due to constant capacity.
+		runcases = make([]runtimeSelect, len(cases), 4)
+	}
+
 	haveDefault := false
 	for i, c := range cases {
 		rc := &runcases[i]
@@ -2269,7 +2613,7 @@ func MakeSlice(typ Type, len, cap int) Value {
 		panic("reflect.MakeSlice: len > cap")
 	}
 
-	s := sliceHeader{unsafe_NewArray(typ.Elem().(*rtype), cap), len, cap}
+	s := unsafeheader.Slice{Data: unsafe_NewArray(typ.Elem().(*rtype), cap), Len: len, Cap: cap}
 	return Value{typ.(*rtype), unsafe.Pointer(&s), flagIndir | flag(Slice)}
 }
 
@@ -2343,10 +2687,22 @@ func Zero(typ Type) Value {
 	t := typ.(*rtype)
 	fl := flag(t.Kind())
 	if ifaceIndir(t) {
-		return Value{t, unsafe_New(t), fl | flagIndir}
+		var p unsafe.Pointer
+		if t.size <= maxZero {
+			p = unsafe.Pointer(&zeroVal[0])
+		} else {
+			p = unsafe_New(t)
+		}
+		return Value{t, p, fl | flagIndir}
 	}
 	return Value{t, nil, fl}
 }
+
+// must match declarations in runtime/map.go.
+const maxZero = 1024
+
+//go:linkname zeroVal runtime.zeroVal
+var zeroVal [maxZero]byte
 
 // New returns a Value representing a pointer to a new zero value
 // for the specified type. That is, the returned Value's Type is PtrTo(typ).
@@ -2355,9 +2711,14 @@ func New(typ Type) Value {
 		panic("reflect: New(nil)")
 	}
 	t := typ.(*rtype)
+	pt := t.ptrTo()
+	if ifaceIndir(pt) {
+		// This is a pointer to a go:notinheap type.
+		panic("reflect: New of type that may not be allocated in heap (possibly undefined cgo C type)")
+	}
 	ptr := unsafe_New(t)
 	fl := flag(Ptr)
-	return Value{t.ptrTo(), ptr, fl}
+	return Value{pt, ptr, fl}
 }
 
 // NewAt returns a Value representing a pointer to a value of the
@@ -2371,6 +2732,7 @@ func NewAt(typ Type, p unsafe.Pointer) Value {
 // assignTo returns a value v that can be assigned directly to typ.
 // It panics if v is not assignable to typ.
 // For a conversion to an interface type, target is a suggested scratch space to use.
+// target must be initialized memory (or nil).
 func (v Value) assignTo(context string, dst *rtype, target unsafe.Pointer) Value {
 	if v.flag&flagMethod != 0 {
 		v = makeMethodValue(context, v)
@@ -2409,7 +2771,7 @@ func (v Value) assignTo(context string, dst *rtype, target unsafe.Pointer) Value
 
 // Convert returns the value v converted to type t.
 // If the usual Go conversion rules do not allow conversion
-// of the value v to type t, Convert panics.
+// of the value v to type t, or if converting v to type t panics, Convert panics.
 func (v Value) Convert(t Type) Value {
 	if v.flag&flagMethod != 0 {
 		v = makeMethodValue("Convert", v)
@@ -2479,6 +2841,11 @@ func convertOp(dst, src *rtype) func(Value, Type) Value {
 			case Int32:
 				return cvtRunesString
 			}
+		}
+		// "x is a slice, T is a pointer-to-array type,
+		// and the slice and array types have identical element types."
+		if dst.Kind() == Ptr && dst.Elem().Kind() == Array && src.Elem() == dst.Elem().Elem() {
+			return cvtSliceArrayPtr
 		}
 
 	case Chan:
@@ -2637,12 +3004,20 @@ func cvtComplex(v Value, t Type) Value {
 
 // convertOp: intXX -> string
 func cvtIntString(v Value, t Type) Value {
-	return makeString(v.flag.ro(), string(rune(v.Int())), t)
+	s := "\uFFFD"
+	if x := v.Int(); int64(rune(x)) == x {
+		s = string(rune(x))
+	}
+	return makeString(v.flag.ro(), s, t)
 }
 
 // convertOp: uintXX -> string
 func cvtUintString(v Value, t Type) Value {
-	return makeString(v.flag.ro(), string(rune(v.Uint())), t)
+	s := "\uFFFD"
+	if x := v.Uint(); uint64(rune(x)) == x {
+		s = string(rune(x))
+	}
+	return makeString(v.flag.ro(), s, t)
 }
 
 // convertOp: []byte -> string
@@ -2663,6 +3038,16 @@ func cvtRunesString(v Value, t Type) Value {
 // convertOp: string -> []rune
 func cvtStringRunes(v Value, t Type) Value {
 	return makeRunes(v.flag.ro(), []rune(v.String()), t)
+}
+
+// convertOp: []T -> *[N]T
+func cvtSliceArrayPtr(v Value, t Type) Value {
+	n := t.Elem().Len()
+	h := (*unsafeheader.Slice)(v.ptr)
+	if n > h.Len {
+		panic("reflect: cannot convert slice with length " + itoa.Itoa(h.Len) + " to array pointer with length " + itoa.Itoa(n))
+	}
+	return Value{t.common(), h.Data, v.flag&^(flagIndir|flagAddr|flagKindMask) | flag(Ptr)}
 }
 
 // convertOp: direct copy
@@ -2750,14 +3135,32 @@ func mapiternext(it unsafe.Pointer)
 //go:noescape
 func maplen(m unsafe.Pointer) int
 
-// call calls fn with a copy of the n argument bytes pointed at by arg.
-// After fn returns, reflectcall copies n-retoffset result bytes
-// back into arg+retoffset before returning. If copying result bytes back,
-// the caller must pass the argument frame type as argtype, so that
-// call can execute appropriate write barriers during the copy.
+// call calls fn with "stackArgsSize" bytes of stack arguments laid out
+// at stackArgs and register arguments laid out in regArgs. frameSize is
+// the total amount of stack space that will be reserved by call, so this
+// should include enough space to spill register arguments to the stack in
+// case of preemption.
 //
+// After fn returns, call copies stackArgsSize-stackRetOffset result bytes
+// back into stackArgs+stackRetOffset before returning, for any return
+// values passed on the stack. Register-based return values will be found
+// in the same regArgs structure.
+//
+// regArgs must also be prepared with an appropriate ReturnIsPtr bitmap
+// indicating which registers will contain pointer-valued return values. The
+// purpose of this bitmap is to keep pointers visible to the GC between
+// returning from reflectcall and actually using them.
+//
+// If copying result bytes back from the stack, the caller must pass the
+// argument frame type as stackArgsType, so that call can execute appropriate
+// write barriers during the copy.
+//
+// Arguments passed through to call do not escape. The type is used only in a
+// very limited callee of call, the stackArgs are copied, and regArgs is only
+// used in the call frame.
+//go:noescape
 //go:linkname call runtime.reflectcall
-func call(argtype *rtype, fn, arg unsafe.Pointer, n uint32, retoffset uint32)
+func call(stackArgsType *rtype, f, stackArgs unsafe.Pointer, stackArgsSize, stackRetOffset, frameSize uint32, regArgs *abi.RegArgs)
 
 func ifaceE2I(t *rtype, src interface{}, dst unsafe.Pointer)
 
@@ -2786,7 +3189,7 @@ func typedmemclrpartial(t *rtype, ptr unsafe.Pointer, off, size uintptr)
 // typedslicecopy copies a slice of elemType values from src to dst,
 // returning the number of elements copied.
 //go:noescape
-func typedslicecopy(elemType *rtype, dst, src sliceHeader) int
+func typedslicecopy(elemType *rtype, dst, src unsafeheader.Slice) int
 
 //go:noescape
 func typehash(t *rtype, p unsafe.Pointer, h uintptr) uintptr

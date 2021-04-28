@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build linux && (mips || mipsle)
 // +build linux
 // +build mips mipsle
 
@@ -80,9 +81,7 @@ func (c *sigctxt) preparePanic(sig uint32, gp *g) {
 	c.set_pc(uint32(funcPC(sigpanic)))
 }
 
-const pushCallSupported = true
-
-func (c *sigctxt) pushCall(targetPC uintptr) {
+func (c *sigctxt) pushCall(targetPC, resumePC uintptr) {
 	// Push the LR to stack, as we'll clobber it in order to
 	// push the call. The function being pushed is responsible
 	// for restoring the LR and setting the SP back.
@@ -91,7 +90,7 @@ func (c *sigctxt) pushCall(targetPC uintptr) {
 	c.set_sp(sp)
 	*(*uint32)(unsafe.Pointer(uintptr(sp))) = c.link()
 	// Set up PC and LR to pretend the function being signaled
-	// calls targetPC at the faulting PC.
-	c.set_link(c.pc())
+	// calls targetPC at resumePC.
+	c.set_link(uint32(resumePC))
 	c.set_pc(uint32(targetPC))
 }

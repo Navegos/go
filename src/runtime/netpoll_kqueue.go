@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build darwin || dragonfly || freebsd || netbsd || openbsd
 // +build darwin dragonfly freebsd netbsd openbsd
 
 package runtime
@@ -18,7 +19,7 @@ var (
 
 	netpollBreakRd, netpollBreakWr uintptr // for netpollBreak
 
-	netpollWakeSig uintptr // used to avoid duplicate calls of netpollBreak
+	netpollWakeSig uint32 // used to avoid duplicate calls of netpollBreak
 )
 
 func netpollinit() {
@@ -83,7 +84,7 @@ func netpollarm(pd *pollDesc, mode int) {
 
 // netpollBreak interrupts a kevent.
 func netpollBreak() {
-	if atomic.Casuintptr(&netpollWakeSig, 0, 1) {
+	if atomic.Cas(&netpollWakeSig, 0, 1) {
 		for {
 			var b byte
 			n := write(netpollBreakWr, unsafe.Pointer(&b), 1)
@@ -152,7 +153,7 @@ retry:
 				// if blocking.
 				var tmp [16]byte
 				read(int32(netpollBreakRd), noescape(unsafe.Pointer(&tmp[0])), int32(len(tmp)))
-				atomic.Storeuintptr(&netpollWakeSig, 0)
+				atomic.Store(&netpollWakeSig, 0)
 			}
 			continue
 		}

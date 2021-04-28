@@ -56,6 +56,7 @@ type fakeConnector struct {
 	name string
 
 	waiter func(context.Context)
+	closed bool
 }
 
 func (c *fakeConnector) Connect(context.Context) (driver.Conn, error) {
@@ -66,6 +67,14 @@ func (c *fakeConnector) Connect(context.Context) (driver.Conn, error) {
 
 func (c *fakeConnector) Driver() driver.Driver {
 	return fdriver
+}
+
+func (c *fakeConnector) Close() error {
+	if c.closed {
+		return errors.New("fakedb: connector is closed")
+	}
+	c.closed = true
+	return nil
 }
 
 type fakeDriverCtx struct {
@@ -390,6 +399,7 @@ func setStrictFakeConnClose(t *testing.T) {
 
 func (c *fakeConn) ResetSession(ctx context.Context) error {
 	c.dirtySession = false
+	c.currTx = nil
 	if c.isBad() {
 		return driver.ErrBadConn
 	}
@@ -734,6 +744,9 @@ var hookExecBadConn func() bool
 func (s *fakeStmt) Exec(args []driver.Value) (driver.Result, error) {
 	panic("Using ExecContext")
 }
+
+var errFakeConnSessionDirty = errors.New("fakedb: session is dirty")
+
 func (s *fakeStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
 	if s.panic == "Exec" {
 		panic(s.panic)
@@ -746,7 +759,7 @@ func (s *fakeStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (d
 		return nil, driver.ErrBadConn
 	}
 	if s.c.isDirtyAndMark() {
-		return nil, errors.New("fakedb: session is dirty")
+		return nil, errFakeConnSessionDirty
 	}
 
 	err := checkSubsetTypes(s.c.db.allowAny, args)
@@ -860,7 +873,7 @@ func (s *fakeStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (
 		return nil, driver.ErrBadConn
 	}
 	if s.c.isDirtyAndMark() {
-		return nil, errors.New("fakedb: session is dirty")
+		return nil, errFakeConnSessionDirty
 	}
 
 	err := checkSubsetTypes(s.c.db.allowAny, args)
@@ -892,6 +905,37 @@ func (s *fakeStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (
 					time.Sleep(time.Duration(args[1].Value.(int64)) * time.Millisecond)
 				}
 			}
+		}
+		if s.table == "tx_status" && s.colName[0] == "tx_status" {
+			txStatus := "autocommit"
+			if s.c.currTx != nil {
+				txStatus = "transaction"
+			}
+			cursor := &rowsCursor{
+				parentMem: s.c,
+				posRow:    -1,
+				rows: [][]*row{
+					{
+						{
+							cols: []interface{}{
+								txStatus,
+							},
+						},
+					},
+				},
+				cols: [][]string{
+					{
+						"tx_status",
+					},
+				},
+				colType: [][]string{
+					{
+						"string",
+					},
+				},
+				errPos: -1,
+			}
+			return cursor, nil
 		}
 
 		t.mu.Lock()

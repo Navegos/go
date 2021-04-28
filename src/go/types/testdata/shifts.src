@@ -20,7 +20,7 @@ func shifts0() {
 		// This depends on the exact spec wording which is not
 		// done yet.
 		// TODO(gri) revisit and adjust when spec change is done
-		_ = 1<<- /* ERROR "truncated to uint" */ 1.0
+		_ = 1<<- /* ERROR "negative shift count" */ 1.0
 		_ = 1<<1075 /* ERROR "invalid shift" */
 		_ = 2.0<<1
 		_ = 1<<1.0
@@ -60,11 +60,13 @@ func shifts1() {
 		_ uint = 1 << u
 		_ float32 = 1 /* ERROR "must be integer" */ << u
 
-		// for issue 14822
+		// issue #14822
+		_ = 1<<( /* ERROR "overflows uint" */ 1<<64)
 		_ = 1<<( /* ERROR "invalid shift count" */ 1<<64-1)
-		_ = 1<<( /* ERROR "invalid shift count" */ 1<<64)
-		_ = u<<(1<<63) // valid
-		_ = u<<(1<<64) // valid
+
+		// issue #43697
+		_ = u<<( /* ERROR "overflows uint" */ 1<<64)
+		_ = u<<(1<<64-1)
 	)
 }
 
@@ -193,14 +195,27 @@ func shifts6() {
 	_ = float32(1.0 /* ERROR "must be integer" */ <<s)
 	_ = float32(1.1 /* ERROR "must be integer" */ <<s)
 
+	_ = int32(0x80000000 /* ERROR "overflows int32" */ << s)
+	// TODO(rfindley) Eliminate the redundant error here.
+	_ = int32(( /* ERROR "truncated to int32" */ 0x80000000 /* ERROR "truncated to int32" */ + 0i) << s)
+
+	_ = int(1+0i<<0)
+	_ = int((1+0i)<<s)
+	_ = int(1.0<<s)
+	_ = int(complex(1, 0)<<s)
+	_ = int(float32/* ERROR "must be integer" */(1.0) <<s)
+	_ = int(1.1 /* ERROR must be integer */ <<s)
+	_ = int(( /* ERROR "must be integer" */ 1+1i)  <<s)
+
+	_ = complex(1 /* ERROR "must be integer" */ <<s, 0)
+
 	var b []int
 	_ = append(b, 1<<s)
 	_ = append(b, 1.0<<s)
+	_ = append(b, (1+0i)<<s)
 	_ = append(b, 1.1 /* ERROR "must be integer" */ <<s)
-
-	_ = append(b, 1<<s)
-	_ = append(b, 1.0<<s) // should fail - see TODO in append code
-	_ = append(b, 1.1 /* ERROR "must be integer" */ <<s)
+	_ = append(b, (1 + 0i) <<s)
+	_ = append(b, ( /* ERROR "must be integer" */ 1 + 1i)  <<s)
 
 	_ = complex(1.0 /* ERROR "must be integer" */ <<s, 0)
 	_ = complex(1.1 /* ERROR "must be integer" */ <<s, 0)

@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build amd64 && (darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris)
 // +build amd64
 // +build darwin dragonfly freebsd linux netbsd openbsd solaris
 
@@ -65,23 +66,22 @@ func (c *sigctxt) preparePanic(sig uint32, gp *g) {
 	pc := uintptr(c.rip())
 	sp := uintptr(c.rsp())
 
+	// In case we are panicking from external code, we need to initialize
+	// Go special registers. We inject sigpanic0 (instead of sigpanic),
+	// which takes care of that.
 	if shouldPushSigpanic(gp, pc, *(*uintptr)(unsafe.Pointer(sp))) {
-		c.pushCall(funcPC(sigpanic))
+		c.pushCall(funcPC(sigpanic0), pc)
 	} else {
 		// Not safe to push the call. Just clobber the frame.
-		c.set_rip(uint64(funcPC(sigpanic)))
+		c.set_rip(uint64(funcPC(sigpanic0)))
 	}
 }
 
-// TODO: Remove pushCallSupported once all platforms support it.
-const pushCallSupported = true
-
-func (c *sigctxt) pushCall(targetPC uintptr) {
-	// Make it look like the signaled instruction called target.
-	pc := uintptr(c.rip())
+func (c *sigctxt) pushCall(targetPC, resumePC uintptr) {
+	// Make it look like we called target at resumePC.
 	sp := uintptr(c.rsp())
 	sp -= sys.PtrSize
-	*(*uintptr)(unsafe.Pointer(sp)) = pc
+	*(*uintptr)(unsafe.Pointer(sp)) = resumePC
 	c.set_rsp(uint64(sp))
 	c.set_rip(uint64(targetPC))
 }

@@ -249,6 +249,7 @@ func writefile(text, file string, flag int) {
 	if flag&writeExec != 0 {
 		mode = 0777
 	}
+	xremove(file) // in case of symlink tricks by misc/reboot test
 	err := ioutil.WriteFile(file, new, mode)
 	if err != nil {
 		fatalf("%v", err)
@@ -383,10 +384,14 @@ func xsamefile(f1, f2 string) bool {
 }
 
 func xgetgoarm() string {
-	if goos == "darwin" || goos == "android" {
-		// Assume all darwin/arm and android devices have VFPv3.
+	if goos == "android" {
+		// Assume all android devices have VFPv3.
 		// These ports are also mostly cross-compiled, so it makes little
 		// sense to auto-detect the setting.
+		return "7"
+	}
+	if goos == "windows" {
+		// windows/arm only works with ARMv7 executables.
 		return "7"
 	}
 	if gohostarch != "arm" || goos != gohostos {

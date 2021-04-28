@@ -5,6 +5,7 @@
 package syscall
 
 import (
+	"internal/itoa"
 	"internal/syscall/windows/sysdll"
 	"sync"
 	"sync/atomic"
@@ -20,7 +21,10 @@ type DLLError struct {
 
 func (e *DLLError) Error() string { return e.Msg }
 
+func (e *DLLError) Unwrap() error { return e.Err }
+
 // Implemented in ../runtime/syscall_windows.go.
+
 func Syscall(trap, nargs, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
 func Syscall6(trap, nargs, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
 func Syscall9(trap, nargs, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno)
@@ -162,7 +166,15 @@ func (p *Proc) Addr() uintptr {
 // The returned error is always non-nil, constructed from the result of GetLastError.
 // Callers must inspect the primary return value to decide whether an error occurred
 // (according to the semantics of the specific function being called) before consulting
-// the error. The error will be guaranteed to contain syscall.Errno.
+// the error. The error always has type syscall.Errno.
+//
+// On amd64, Call can pass and return floating-point values. To pass
+// an argument x with C type "float", use
+// uintptr(math.Float32bits(x)). To pass an argument with C type
+// "double", use uintptr(math.Float64bits(x)). Floating-point return
+// values are returned in r2. The return value for C type "float" is
+// math.Float32frombits(uint32(r2)). For C type "double", it is
+// math.Float64frombits(uint64(r2)).
 func (p *Proc) Call(a ...uintptr) (r1, r2 uintptr, lastErr error) {
 	switch len(a) {
 	case 0:
@@ -204,7 +216,7 @@ func (p *Proc) Call(a ...uintptr) (r1, r2 uintptr, lastErr error) {
 	case 18:
 		return Syscall18(p.Addr(), uintptr(len(a)), a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17])
 	default:
-		panic("Call " + p.Name + " with too many arguments " + itoa(len(a)) + ".")
+		panic("Call " + p.Name + " with too many arguments " + itoa.Itoa(len(a)) + ".")
 	}
 }
 

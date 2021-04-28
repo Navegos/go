@@ -10,6 +10,9 @@ import (
 	"fmt"
 )
 
+// Notes:
+//  - Boolean types occupy the entire register. 0=false, 1=true.
+
 // Suffixes encode the bit width of various instructions:
 //
 // D (double word) = 64 bit int
@@ -21,10 +24,11 @@ import (
 // L               = 64 bit int, used when the opcode starts with F
 
 const (
-	riscv64REG_G    = 4
+	riscv64REG_G    = 27
 	riscv64REG_CTXT = 20
 	riscv64REG_LR   = 1
 	riscv64REG_SP   = 2
+	riscv64REG_TP   = 4
 	riscv64REG_TMP  = 31
 	riscv64REG_ZERO = 0
 )
@@ -75,8 +79,8 @@ func init() {
 
 		// Add general purpose registers to gpMask.
 		switch r {
-		// ZERO, and TMP are not in any gp mask.
-		case riscv64REG_ZERO, riscv64REG_TMP:
+		// ZERO, TP and TMP are not in any gp mask.
+		case riscv64REG_ZERO, riscv64REG_TP, riscv64REG_TMP:
 		case riscv64REG_G:
 			gpgMask |= mask
 			gpspsbgMask |= mask
@@ -122,6 +126,7 @@ func init() {
 		gp11sb   = regInfo{inputs: []regMask{gpspsbMask}, outputs: []regMask{gpMask}}
 		gpxchg   = regInfo{inputs: []regMask{gpspsbgMask, gpgMask}, outputs: []regMask{gpMask}}
 		gpcas    = regInfo{inputs: []regMask{gpspsbgMask, gpgMask, gpgMask}, outputs: []regMask{gpMask}}
+		gpatomic = regInfo{inputs: []regMask{gpspsbgMask, gpgMask}}
 
 		fp11    = regInfo{inputs: []regMask{fpMask}, outputs: []regMask{fpMask}}
 		fp21    = regInfo{inputs: []regMask{fpMask, fpMask}, outputs: []regMask{fpMask}}
@@ -163,9 +168,6 @@ func init() {
 		{name: "MOVaddr", argLength: 1, reg: gp11sb, asm: "MOV", aux: "SymOff", rematerializeable: true, symEffect: "RdWr"}, // arg0 + auxint + offset encoded in aux
 		// auxint+aux == add auxint and the offset of the symbol in aux (if any) to the effective address
 
-		{name: "MOVBconst", reg: gp01, asm: "MOV", typ: "UInt8", aux: "Int8", rematerializeable: true},   // 8 low bits of auxint
-		{name: "MOVHconst", reg: gp01, asm: "MOV", typ: "UInt16", aux: "Int16", rematerializeable: true}, // 16 low bits of auxint
-		{name: "MOVWconst", reg: gp01, asm: "MOV", typ: "UInt32", aux: "Int32", rematerializeable: true}, // 32 low bits of auxint
 		{name: "MOVDconst", reg: gp01, asm: "MOV", typ: "UInt64", aux: "Int64", rematerializeable: true}, // auxint
 
 		// Loads: load <size> bits from arg0+auxint+aux and extend to 64 bits; arg1=mem
@@ -188,6 +190,17 @@ func init() {
 		{name: "MOVHstorezero", argLength: 2, reg: gpstore0, aux: "SymOff", asm: "MOVH", typ: "Mem", faultOnNilArg0: true, symEffect: "Write"}, // 16 bits
 		{name: "MOVWstorezero", argLength: 2, reg: gpstore0, aux: "SymOff", asm: "MOVW", typ: "Mem", faultOnNilArg0: true, symEffect: "Write"}, // 32 bits
 		{name: "MOVDstorezero", argLength: 2, reg: gpstore0, aux: "SymOff", asm: "MOV", typ: "Mem", faultOnNilArg0: true, symEffect: "Write"},  // 64 bits
+
+		// Conversions
+		{name: "MOVBreg", argLength: 1, reg: gp11, asm: "MOVB"},   // move from arg0, sign-extended from byte
+		{name: "MOVHreg", argLength: 1, reg: gp11, asm: "MOVH"},   // move from arg0, sign-extended from half
+		{name: "MOVWreg", argLength: 1, reg: gp11, asm: "MOVW"},   // move from arg0, sign-extended from word
+		{name: "MOVDreg", argLength: 1, reg: gp11, asm: "MOV"},    // move from arg0
+		{name: "MOVBUreg", argLength: 1, reg: gp11, asm: "MOVBU"}, // move from arg0, unsign-extended from byte
+		{name: "MOVHUreg", argLength: 1, reg: gp11, asm: "MOVHU"}, // move from arg0, unsign-extended from half
+		{name: "MOVWUreg", argLength: 1, reg: gp11, asm: "MOVWU"}, // move from arg0, unsign-extended from word
+
+		{name: "MOVDnop", argLength: 1, reg: regInfo{inputs: []regMask{gpMask}, outputs: []regMask{gpMask}}, resultInArg0: true}, // nop, return arg0 in same register
 
 		// Shift ops
 		{name: "SLL", argLength: 2, reg: gp21, asm: "SLL"},                 // arg0 << (aux1 & 63)
@@ -221,9 +234,47 @@ func init() {
 		{name: "MOVconvert", argLength: 2, reg: gp11, asm: "MOV"}, // arg0, but converted to int/ptr as appropriate; arg1=mem
 
 		// Calls
-		{name: "CALLstatic", argLength: 1, reg: call, aux: "SymOff", call: true, symEffect: "None"}, // call static function aux.(*gc.Sym). arg0=mem, auxint=argsize, returns mem
-		{name: "CALLclosure", argLength: 3, reg: callClosure, aux: "Int64", call: true},             // call function via closure. arg0=codeptr, arg1=closure, arg2=mem, auxint=argsize, returns mem
-		{name: "CALLinter", argLength: 2, reg: callInter, aux: "Int64", call: true},                 // call fn by pointer. arg0=codeptr, arg1=mem, auxint=argsize, returns mem
+		{name: "CALLstatic", argLength: 1, reg: call, aux: "CallOff", call: true},         // call static function aux.(*gc.Sym). arg0=mem, auxint=argsize, returns mem
+		{name: "CALLclosure", argLength: 3, reg: callClosure, aux: "CallOff", call: true}, // call function via closure. arg0=codeptr, arg1=closure, arg2=mem, auxint=argsize, returns mem
+		{name: "CALLinter", argLength: 2, reg: callInter, aux: "CallOff", call: true},     // call fn by pointer. arg0=codeptr, arg1=mem, auxint=argsize, returns mem
+
+		// duffzero
+		// arg0 = address of memory to zero (in X10, changed as side effect)
+		// arg1 = mem
+		// auxint = offset into duffzero code to start executing
+		// X1 (link register) changed because of function call
+		// returns mem
+		{
+			name:      "DUFFZERO",
+			aux:       "Int64",
+			argLength: 2,
+			reg: regInfo{
+				inputs:   []regMask{regNamed["X10"]},
+				clobbers: regNamed["X1"] | regNamed["X10"],
+			},
+			typ:            "Mem",
+			faultOnNilArg0: true,
+		},
+
+		// duffcopy
+		// arg0 = address of dst memory (in X11, changed as side effect)
+		// arg1 = address of src memory (in X10, changed as side effect)
+		// arg2 = mem
+		// auxint = offset into duffcopy code to start executing
+		// X1 (link register) changed because of function call
+		// returns mem
+		{
+			name:      "DUFFCOPY",
+			aux:       "Int64",
+			argLength: 3,
+			reg: regInfo{
+				inputs:   []regMask{regNamed["X11"], regNamed["X10"]},
+				clobbers: regNamed["X1"] | regNamed["X10"] | regNamed["X11"],
+			},
+			typ:            "Mem",
+			faultOnNilArg0: true,
+			faultOnNilArg1: true,
+		},
 
 		// Generic moves and zeros
 
@@ -282,7 +333,7 @@ func init() {
 		{name: "LoweredAtomicLoad64", argLength: 2, reg: gpload, faultOnNilArg0: true},
 
 		// Atomic stores.
-		// store arg1 to arg0. arg2=mem. returns memory.
+		// store arg1 to *arg0. arg2=mem. returns memory.
 		{name: "LoweredAtomicStore8", argLength: 3, reg: gpstore, faultOnNilArg0: true, hasSideEffects: true},
 		{name: "LoweredAtomicStore32", argLength: 3, reg: gpstore, faultOnNilArg0: true, hasSideEffects: true},
 		{name: "LoweredAtomicStore64", argLength: 3, reg: gpstore, faultOnNilArg0: true, hasSideEffects: true},
@@ -314,6 +365,11 @@ func init() {
 		{name: "LoweredAtomicCas32", argLength: 4, reg: gpcas, resultNotInArgs: true, faultOnNilArg0: true, hasSideEffects: true, unsafePoint: true},
 		{name: "LoweredAtomicCas64", argLength: 4, reg: gpcas, resultNotInArgs: true, faultOnNilArg0: true, hasSideEffects: true, unsafePoint: true},
 
+		// Atomic 32 bit AND/OR.
+		// *arg0 &= (|=) arg1. arg2=mem. returns nil.
+		{name: "LoweredAtomicAnd32", argLength: 3, reg: gpatomic, asm: "AMOANDW", faultOnNilArg0: true, hasSideEffects: true},
+		{name: "LoweredAtomicOr32", argLength: 3, reg: gpatomic, asm: "AMOORW", faultOnNilArg0: true, hasSideEffects: true},
+
 		// Lowering pass-throughs
 		{name: "LoweredNilCheck", argLength: 2, faultOnNilArg0: true, nilCheck: true, reg: regInfo{inputs: []regMask{gpspMask}}}, // arg0=ptr,arg1=mem, returns void.  Faults if ptr is nil.
 		{name: "LoweredGetClosurePtr", reg: regInfo{outputs: []regMask{regCtxt}}},                                                // scheduler ensures only at beginning of entry block
@@ -336,9 +392,9 @@ func init() {
 		// There are three of these functions so that they can have three different register inputs.
 		// When we check 0 <= c <= cap (A), then 0 <= b <= c (B), then 0 <= a <= b (C), we want the
 		// default registers to match so we don't need to copy registers around unnecessarily.
-		{name: "LoweredPanicBoundsA", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{regNamed["X7"], regNamed["X28"]}}, typ: "Mem"}, // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in genericOps.go).
-		{name: "LoweredPanicBoundsB", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{regNamed["X6"], regNamed["X7"]}}, typ: "Mem"},  // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in genericOps.go).
-		{name: "LoweredPanicBoundsC", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{regNamed["X5"], regNamed["X6"]}}, typ: "Mem"},  // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in genericOps.go).
+		{name: "LoweredPanicBoundsA", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{regNamed["X7"], regNamed["X28"]}}, typ: "Mem", call: true}, // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in genericOps.go).
+		{name: "LoweredPanicBoundsB", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{regNamed["X6"], regNamed["X7"]}}, typ: "Mem", call: true},  // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in genericOps.go).
+		{name: "LoweredPanicBoundsC", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{regNamed["X5"], regNamed["X6"]}}, typ: "Mem", call: true},  // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in genericOps.go).
 
 		// F extension.
 		{name: "FADDS", argLength: 2, reg: fp21, asm: "FADDS", commutative: true, typ: "Float32"},                                           // arg0 + arg1
@@ -382,7 +438,19 @@ func init() {
 	}
 
 	RISCV64blocks := []blockData{
-		{name: "BNE", controls: 1}, // Control != 0 (take a register)
+		{name: "BEQ", controls: 2},
+		{name: "BNE", controls: 2},
+		{name: "BLT", controls: 2},
+		{name: "BGE", controls: 2},
+		{name: "BLTU", controls: 2},
+		{name: "BGEU", controls: 2},
+
+		{name: "BEQZ", controls: 1},
+		{name: "BNEZ", controls: 1},
+		{name: "BLEZ", controls: 1},
+		{name: "BGEZ", controls: 1},
+		{name: "BLTZ", controls: 1},
+		{name: "BGTZ", controls: 1},
 	}
 
 	archs = append(archs, arch{

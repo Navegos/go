@@ -368,22 +368,15 @@ const (
 	C_LCON   /* other 32 */
 	C_DCON   /* other 64 (could subdivide further) */
 	C_SACON  /* $n(REG) where n <= int16 */
-	C_SECON
-	C_LACON /* $n(REG) where int16 < n <= int32 */
-	C_LECON
-	C_DACON /* $n(REG) where int32 < n */
+	C_LACON  /* $n(REG) where int16 < n <= int32 */
+	C_DACON  /* $n(REG) where int32 < n */
 	C_SBRA
 	C_LBRA
 	C_LBRAPIC
-	C_SAUTO
-	C_LAUTO
-	C_SEXT
-	C_LEXT
 	C_ZOREG // conjecture: either (1) register + zeroed offset, or (2) "R0" implies zero or C_REG
-	C_SOREG // register + signed offset
-	C_LOREG
+	C_SOREG // D/DS form memory operation
+	C_LOREG // 32 bit addis + D/DS-form memory operation
 	C_FPSCR
-	C_MSR
 	C_XER
 	C_LR
 	C_CTR
@@ -458,6 +451,10 @@ const (
 	ADIVWUCC
 	ADIVWUVCC
 	ADIVWUV
+	AMODUD
+	AMODUW
+	AMODSD
+	AMODSW
 	AEQV
 	AEQVCC
 	AEXTSB
@@ -565,18 +562,13 @@ const (
 	AORNCC
 	AORIS
 	AREM
-	AREMCC
-	AREMV
-	AREMVCC
 	AREMU
-	AREMUCC
-	AREMUV
-	AREMUVCC
 	ARFI
 	ARLWMI
 	ARLWMICC
 	ARLWNM
 	ARLWNMCC
+	ACLRLSLWI
 	ASLW
 	ASLWCC
 	ASRW
@@ -584,6 +576,7 @@ const (
 	ASRAWCC
 	ASRWCC
 	ASTBCCC
+	ASTHCCC
 	ASTSW
 	ASTWCCC
 	ASUB
@@ -717,6 +710,9 @@ const (
 	ARLDCLCC
 	ARLDICL
 	ARLDICLCC
+	ARLDIC
+	ARLDICCC
+	ACLRLSLDI
 	AROTL
 	AROTLW
 	ASLBIA
@@ -730,19 +726,15 @@ const (
 	ASRAD
 	ASRADCC
 	ASRDCC
+	AEXTSWSLI
+	AEXTSWSLICC
 	ASTDCCC
 	ATD
 
 	/* 64-bit pseudo operation */
 	ADWORD
 	AREMD
-	AREMDCC
-	AREMDV
-	AREMDVCC
 	AREMDU
-	AREMDUCC
-	AREMDUV
-	AREMDUVCC
 
 	/* more 64-bit operations */
 	AHRFID
@@ -906,8 +898,15 @@ const (
 	AVCMPGTSDCC
 	AVCMPNEZB
 	AVCMPNEZBCC
+	AVCMPNEB
+	AVCMPNEBCC
+	AVCMPNEH
+	AVCMPNEHCC
+	AVCMPNEW
+	AVCMPNEWCC
 	AVPERM
 	AVPERMXOR
+	AVPERMR
 	AVBPERMQ
 	AVBPERMD
 	AVSEL
@@ -934,16 +933,22 @@ const (
 
 	/* VSX */
 	ALXV
+	ALXVL
+	ALXVLL
 	ALXVD2X
 	ALXVW4X
 	ALXVH8X
 	ALXVB16X
+	ALXVX
 	ALXVDSX
 	ASTXV
+	ASTXVL
+	ASTXVLL
 	ASTXVD2X
 	ASTXVW4X
 	ASTXVH8X
 	ASTXVB16X
+	ASTXVX
 	ALXSDX
 	ASTXSDX
 	ALXSIWAX
@@ -975,9 +980,14 @@ const (
 	AXXMRGLW
 	AXXSPLT
 	AXXSPLTW
+	AXXSPLTIB
 	AXXPERM
 	AXXPERMDI
 	AXXSLDWI
+	AXXBRQ
+	AXXBRD
+	AXXBRW
+	AXXBRH
 	AXSCVDPSP
 	AXSCVSPDP
 	AXSCVDPSPN

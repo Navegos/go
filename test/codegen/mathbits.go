@@ -76,7 +76,15 @@ func Len64(n uint64) int {
 	// arm:"CLZ" arm64:"CLZ"
 	// mips:"CLZ"
 	// wasm:"I64Clz"
+	// ppc64le:"SUBC","CNTLZD"
+	// ppc64:"SUBC","CNTLZD"
 	return bits.Len64(n)
+}
+
+func SubFromLen64(n uint64) int {
+	// ppc64le:"CNTLZD",-"SUBC"
+	// ppc64:"CNTLZD",-"SUBC"
+	return 64 - bits.Len64(n)
 }
 
 func Len32(n uint32) int {
@@ -110,7 +118,7 @@ func Len8(n uint8) int {
 //    bits.OnesCount    //
 // -------------------- //
 
-// amd64:".*x86HasPOPCNT"
+// TODO(register args) Restore a m d 6 4 :.*x86HasPOPCNT when only one ABI is tested.
 func OnesCount(n uint) int {
 	// amd64:"POPCNTQ"
 	// arm64:"VCNT","VUADDLV"
@@ -121,7 +129,6 @@ func OnesCount(n uint) int {
 	return bits.OnesCount(n)
 }
 
-// amd64:".*x86HasPOPCNT"
 func OnesCount64(n uint64) int {
 	// amd64:"POPCNTQ"
 	// arm64:"VCNT","VUADDLV"
@@ -132,7 +139,6 @@ func OnesCount64(n uint64) int {
 	return bits.OnesCount64(n)
 }
 
-// amd64:".*x86HasPOPCNT"
 func OnesCount32(n uint32) int {
 	// amd64:"POPCNTL"
 	// arm64:"VCNT","VUADDLV"
@@ -143,7 +149,6 @@ func OnesCount32(n uint32) int {
 	return bits.OnesCount32(n)
 }
 
-// amd64:".*x86HasPOPCNT"
 func OnesCount16(n uint16) int {
 	// amd64:"POPCNTL"
 	// arm64:"VCNT","VUADDLV"
@@ -205,7 +210,7 @@ func RotateLeft64(n uint64) uint64 {
 	// arm64:"ROR"
 	// ppc64:"ROTL"
 	// ppc64le:"ROTL"
-	// s390x:"RLLG"
+	// s390x:"RISBGZ\t[$]0, [$]63, [$]37, "
 	// wasm:"I64Rotl"
 	return bits.RotateLeft64(n, 37)
 }
@@ -289,6 +294,12 @@ func TrailingZeros64(n uint64) int {
 	// ppc64le/power9: "CNTTZD"
 	// wasm:"I64Ctz"
 	return bits.TrailingZeros64(n)
+}
+
+func TrailingZeros64Subtract(n uint64) int {
+	// ppc64le/power8:"NEG","SUBC","ANDN","POPCNTD"
+	// ppc64le/power9:"SUBC","CNTTZD"
+	return bits.TrailingZeros64(1 - n)
 }
 
 func TrailingZeros32(n uint32) int {
@@ -472,6 +483,69 @@ func Add64M(p, q, r *[3]uint64) {
 	r[2], c = bits.Add64(p[2], q[2], c)
 }
 
+func Add64PanicOnOverflowEQ(a, b uint64) uint64 {
+	r, c := bits.Add64(a, b, 0)
+	// s390x:"BRC\t[$]3,",-"ADDE"
+	if c == 1 {
+		panic("overflow")
+	}
+	return r
+}
+
+func Add64PanicOnOverflowNE(a, b uint64) uint64 {
+	r, c := bits.Add64(a, b, 0)
+	// s390x:"BRC\t[$]3,",-"ADDE"
+	if c != 0 {
+		panic("overflow")
+	}
+	return r
+}
+
+func Add64PanicOnOverflowGT(a, b uint64) uint64 {
+	r, c := bits.Add64(a, b, 0)
+	// s390x:"BRC\t[$]3,",-"ADDE"
+	if c > 0 {
+		panic("overflow")
+	}
+	return r
+}
+
+func Add64MPanicOnOverflowEQ(a, b [2]uint64) [2]uint64 {
+	var r [2]uint64
+	var c uint64
+	r[0], c = bits.Add64(a[0], b[0], c)
+	r[1], c = bits.Add64(a[1], b[1], c)
+	// s390x:"BRC\t[$]3,"
+	if c == 1 {
+		panic("overflow")
+	}
+	return r
+}
+
+func Add64MPanicOnOverflowNE(a, b [2]uint64) [2]uint64 {
+	var r [2]uint64
+	var c uint64
+	r[0], c = bits.Add64(a[0], b[0], c)
+	r[1], c = bits.Add64(a[1], b[1], c)
+	// s390x:"BRC\t[$]3,"
+	if c != 0 {
+		panic("overflow")
+	}
+	return r
+}
+
+func Add64MPanicOnOverflowGT(a, b [2]uint64) [2]uint64 {
+	var r [2]uint64
+	var c uint64
+	r[0], c = bits.Add64(a[0], b[0], c)
+	r[1], c = bits.Add64(a[1], b[1], c)
+	// s390x:"BRC\t[$]3,"
+	if c > 0 {
+		panic("overflow")
+	}
+	return r
+}
+
 // --------------- //
 //    bits.Sub*    //
 // --------------- //
@@ -550,6 +624,69 @@ func Sub64M(p, q, r *[3]uint64) {
 	// s390x:"SUBE"
 	r[1], c = bits.Sub64(p[1], q[1], c)
 	r[2], c = bits.Sub64(p[2], q[2], c)
+}
+
+func Sub64PanicOnOverflowEQ(a, b uint64) uint64 {
+	r, b := bits.Sub64(a, b, 0)
+	// s390x:"BRC\t[$]12,",-"ADDE",-"SUBE"
+	if b == 1 {
+		panic("overflow")
+	}
+	return r
+}
+
+func Sub64PanicOnOverflowNE(a, b uint64) uint64 {
+	r, b := bits.Sub64(a, b, 0)
+	// s390x:"BRC\t[$]12,",-"ADDE",-"SUBE"
+	if b != 0 {
+		panic("overflow")
+	}
+	return r
+}
+
+func Sub64PanicOnOverflowGT(a, b uint64) uint64 {
+	r, b := bits.Sub64(a, b, 0)
+	// s390x:"BRC\t[$]12,",-"ADDE",-"SUBE"
+	if b > 0 {
+		panic("overflow")
+	}
+	return r
+}
+
+func Sub64MPanicOnOverflowEQ(a, b [2]uint64) [2]uint64 {
+	var r [2]uint64
+	var c uint64
+	r[0], c = bits.Sub64(a[0], b[0], c)
+	r[1], c = bits.Sub64(a[1], b[1], c)
+	// s390x:"BRC\t[$]12,"
+	if c == 1 {
+		panic("overflow")
+	}
+	return r
+}
+
+func Sub64MPanicOnOverflowNE(a, b [2]uint64) [2]uint64 {
+	var r [2]uint64
+	var c uint64
+	r[0], c = bits.Sub64(a[0], b[0], c)
+	r[1], c = bits.Sub64(a[1], b[1], c)
+	// s390x:"BRC\t[$]12,"
+	if c != 0 {
+		panic("overflow")
+	}
+	return r
+}
+
+func Sub64MPanicOnOverflowGT(a, b [2]uint64) [2]uint64 {
+	var r [2]uint64
+	var c uint64
+	r[0], c = bits.Sub64(a[0], b[0], c)
+	r[1], c = bits.Sub64(a[1], b[1], c)
+	// s390x:"BRC\t[$]12,"
+	if c > 0 {
+		panic("overflow")
+	}
+	return r
 }
 
 // --------------- //
