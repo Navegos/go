@@ -68,7 +68,7 @@ func elfreloc1(ctxt *ld.Link, out *ld.OutBuf, ldr *loader.Loader, s loader.Sym, 
 	return true
 }
 
-func elfsetupplt(ctxt *ld.Link, plt, gotplt *loader.SymbolBuilder, dynamic loader.Sym) {
+func elfsetupplt(ctxt *ld.Link, ldr *loader.Loader, plt, gotplt *loader.SymbolBuilder, dynamic loader.Sym) {
 	return
 }
 
@@ -92,7 +92,6 @@ func applyrel(arch *sys.Arch, ldr *loader.Loader, rt objabi.RelocType, off int32
 
 func archreloc(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, r loader.Reloc, s loader.Sym, val int64) (o int64, nExtReloc int, ok bool) {
 	rs := r.Sym()
-	rs = ldr.ResolveABIAlias(rs)
 	if target.IsExternal() {
 		switch r.Type() {
 		default:

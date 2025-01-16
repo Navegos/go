@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build ignore
-// +build ignore
 
 package main
 
@@ -25,6 +24,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "dump: %s\n", err)
 			os.Exit(1)
 		}
+		defer file.Close()
 	}
 	gob.Debug(file)
 }

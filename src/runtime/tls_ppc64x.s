@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build ppc64 ppc64le
+//go:build ppc64 || ppc64le
 
 #include "go_asm.h"
 #include "go_tls.h"
@@ -24,9 +24,11 @@
 // NOTE: setg_gcc<> assume this clobbers only R31.
 TEXT runtime·save_g(SB),NOSPLIT|NOFRAME,$0-0
 #ifndef GOOS_aix
+#ifndef GOOS_openbsd
 	MOVBZ	runtime·iscgo(SB), R31
 	CMP	R31, $0
 	BEQ	nocgo
+#endif
 #endif
 	MOVD	runtime·tls_g(SB), R31
 	MOVD	g, 0(R31)

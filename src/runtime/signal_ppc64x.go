@@ -2,14 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build (aix || linux) && (ppc64 || ppc64le)
-// +build aix linux
-// +build ppc64 ppc64le
+//go:build (aix || linux || openbsd) && (ppc64 || ppc64le)
 
 package runtime
 
 import (
-	"runtime/internal/sys"
+	"internal/abi"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -56,7 +55,8 @@ func dumpregs(c *sigctxt) {
 
 //go:nosplit
 //go:nowritebarrierrec
-func (c *sigctxt) sigpc() uintptr { return uintptr(c.pc()) }
+func (c *sigctxt) sigpc() uintptr    { return uintptr(c.pc()) }
+func (c *sigctxt) setsigpc(x uint64) { c.set_pc(x) }
 
 func (c *sigctxt) sigsp() uintptr { return uintptr(c.sp()) }
 func (c *sigctxt) siglr() uintptr { return uintptr(c.link()) }
@@ -83,8 +83,8 @@ func (c *sigctxt) preparePanic(sig uint32, gp *g) {
 	// In case we are panicking from external C code
 	c.set_r0(0)
 	c.set_r30(uint64(uintptr(unsafe.Pointer(gp))))
-	c.set_r12(uint64(funcPC(sigpanic)))
-	c.set_pc(uint64(funcPC(sigpanic)))
+	c.set_r12(uint64(abi.FuncPCABIInternal(sigpanic)))
+	c.set_pc(uint64(abi.FuncPCABIInternal(sigpanic)))
 }
 
 func (c *sigctxt) pushCall(targetPC, resumePC uintptr) {

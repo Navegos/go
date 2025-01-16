@@ -5,7 +5,9 @@
 package runtime
 
 import (
-	"runtime/internal/sys"
+	"internal/abi"
+	"internal/goarch"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -53,7 +55,7 @@ func (c *sigctxt) set_sp(x uint64)      { c.regs().gregs[15] = x }
 func (c *sigctxt) set_pc(x uint64)      { c.regs().psw_addr = x }
 func (c *sigctxt) set_sigcode(x uint32) { c.info.si_code = int32(x) }
 func (c *sigctxt) set_sigaddr(x uint64) {
-	*(*uintptr)(add(unsafe.Pointer(c.info), 2*sys.PtrSize)) = uintptr(x)
+	*(*uintptr)(add(unsafe.Pointer(c.info), 2*goarch.PtrSize)) = uintptr(x)
 }
 
 func dumpregs(c *sigctxt) {
@@ -107,7 +109,7 @@ func (c *sigctxt) preparePanic(sig uint32, gp *g) {
 	// In case we are panicking from external C code
 	c.set_r0(0)
 	c.set_r13(uint64(uintptr(unsafe.Pointer(gp))))
-	c.set_pc(uint64(funcPC(sigpanic)))
+	c.set_pc(uint64(abi.FuncPCABIInternal(sigpanic)))
 }
 
 func (c *sigctxt) pushCall(targetPC, resumePC uintptr) {

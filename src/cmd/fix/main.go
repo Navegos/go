@@ -13,14 +13,16 @@ import (
 	"go/parser"
 	"go/scanner"
 	"go/token"
+	"go/version"
+	"internal/diff"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
-	"cmd/internal/diff"
+	"cmd/internal/telemetry/counter"
 )
 
 var (
@@ -36,7 +38,10 @@ var forceRewrites = flag.String("force", "",
 
 var allowed, force map[string]bool
 
-var doDiff = flag.Bool("diff", false, "display diffs instead of rewriting files")
+var (
+	doDiff    = flag.Bool("diff", false, "display diffs instead of rewriting files")
+	goVersion = flag.String("go", "", "go language version for files")
+)
 
 // enable for debugging fix failures
 const debug = false // display incorrectly reformatted source and exit
@@ -45,7 +50,9 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "usage: go tool fix [-diff] [-r fixname,...] [-force fixname,...] [path ...]\n")
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, "\nAvailable rewrites are:\n")
-	sort.Sort(byName(fixes))
+	slices.SortFunc(fixes, func(a, b fix) int {
+		return strings.Compare(a.name, b.name)
+	})
 	for _, f := range fixes {
 		if f.disabled {
 			fmt.Fprintf(os.Stderr, "\n%s (disabled)\n", f.name)
@@ -60,10 +67,20 @@ func usage() {
 }
 
 func main() {
+	counter.Open()
 	flag.Usage = usage
 	flag.Parse()
+	counter.Inc("fix/invocations")
+	counter.CountFlags("fix/flag:", *flag.CommandLine)
 
-	sort.Sort(byDate(fixes))
+	if !version.IsValid(*goVersion) {
+		report(fmt.Errorf("invalid -go=%s", *goVersion))
+		os.Exit(exitCode)
+	}
+
+	slices.SortFunc(fixes, func(a, b fix) int {
+		return strings.Compare(a.date, b.date)
+	})
 
 	if *allowedRewrites != "" {
 		allowed = make(map[string]bool)
@@ -116,7 +133,7 @@ func gofmtFile(f *ast.File) ([]byte, error) {
 func processFile(filename string, useStdin bool) error {
 	var f *os.File
 	var err error
-	var fixlog bytes.Buffer
+	var fixlog strings.Builder
 
 	if useStdin {
 		f = os.Stdin
@@ -202,12 +219,7 @@ func processFile(filename string, useStdin bool) error {
 	}
 
 	if *doDiff {
-		data, err := diff.Diff("go-fix", src, newSrc)
-		if err != nil {
-			return fmt.Errorf("computing diff: %s", err)
-		}
-		fmt.Printf("diff %s fixed/%s\n", filename, filename)
-		os.Stdout.Write(data)
+		os.Stdout.Write(diff.Diff(filename, src, "fixed/"+filename, newSrc))
 		return nil
 	}
 
@@ -219,8 +231,8 @@ func processFile(filename string, useStdin bool) error {
 	return os.WriteFile(f.Name(), newSrc, 0)
 }
 
-func gofmt(n interface{}) string {
-	var gofmtBuf bytes.Buffer
+func gofmt(n any) string {
+	var gofmtBuf strings.Builder
 	if err := format.Node(&gofmtBuf, fset, n); err != nil {
 		return "<" + err.Error() + ">"
 	}

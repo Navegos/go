@@ -6,7 +6,9 @@ package embedtest
 
 import (
 	"embed"
+	"io"
 	"reflect"
+	"slices"
 	"testing"
 	"testing/fstest"
 )
@@ -55,10 +57,15 @@ func testDir(t *testing.T, f embed.FS, name string, expect ...string) {
 		}
 		names = append(names, name)
 	}
-	if !reflect.DeepEqual(names, expect) {
+	if !slices.Equal(names, expect) {
 		t.Errorf("readdir %v = %v, want %v", name, names, expect)
 	}
 }
+
+// Tests for issue 49514.
+var _ = '"'
+var _ = '\''
+var _ = '🦆'
 
 func TestGlobal(t *testing.T) {
 	testFiles(t, global, "concurrency.txt", "Concurrency is not parallelism.\n")
@@ -89,11 +96,13 @@ func TestDir(t *testing.T) {
 	testDir(t, all, "testdata/i/j/k", "k8s.txt")
 }
 
-//go:embed testdata
-var testHiddenDir embed.FS
+var (
+	//go:embed testdata
+	testHiddenDir embed.FS
 
-//go:embed testdata/*
-var testHiddenStar embed.FS
+	//go:embed testdata/*
+	testHiddenStar embed.FS
+)
 
 func TestHidden(t *testing.T) {
 	dir := testHiddenDir
@@ -102,12 +111,12 @@ func TestHidden(t *testing.T) {
 	t.Logf("//go:embed testdata")
 
 	testDir(t, dir, "testdata",
-		"ascii.txt", "glass.txt", "hello.txt", "i/", "ken.txt")
+		"-not-hidden/", "ascii.txt", "glass.txt", "hello.txt", "i/", "ken.txt")
 
 	t.Logf("//go:embed testdata/*")
 
 	testDir(t, star, "testdata",
-		".hidden/", "_hidden/", "ascii.txt", "glass.txt", "hello.txt", "i/", "ken.txt")
+		"-not-hidden/", ".hidden/", "_hidden/", "ascii.txt", "glass.txt", "hello.txt", "i/", "ken.txt")
 
 	testDir(t, star, "testdata/.hidden",
 		"fortune.txt", "more/") // but not .more or _more
@@ -127,5 +136,116 @@ func TestUninitialized(t *testing.T) {
 	}
 	if !fi.IsDir() {
 		t.Errorf("in uninitialized embed.FS, . is not a directory")
+	}
+}
+
+var (
+	//go:embed "testdata/hello.txt"
+	helloT []T
+	//go:embed "testdata/hello.txt"
+	helloUint8 []uint8
+	//go:embed "testdata/hello.txt"
+	helloEUint8 []EmbedUint8
+	//go:embed "testdata/hello.txt"
+	helloBytes EmbedBytes
+	//go:embed "testdata/hello.txt"
+	helloString EmbedString
+)
+
+type T byte
+type EmbedUint8 uint8
+type EmbedBytes []byte
+type EmbedString string
+
+// golang.org/issue/47735
+func TestAliases(t *testing.T) {
+	all := testDirAll
+	want, e := all.ReadFile("testdata/hello.txt")
+	if e != nil {
+		t.Fatal("ReadFile:", e)
+	}
+	check := func(g any) {
+		got := reflect.ValueOf(g)
+		for i := 0; i < got.Len(); i++ {
+			if byte(got.Index(i).Uint()) != want[i] {
+				t.Fatalf("got %v want %v", got.Bytes(), want)
+			}
+		}
+	}
+	check(helloT)
+	check(helloUint8)
+	check(helloEUint8)
+	check(helloBytes)
+	check(helloString)
+}
+
+func TestOffset(t *testing.T) {
+	file, err := testDirAll.Open("testdata/hello.txt")
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	want := "hello, world\n"
+
+	// Read the entire file.
+	got := make([]byte, len(want))
+	n, err := file.Read(got)
+	if err != nil {
+		t.Fatal("Read:", err)
+	}
+	if n != len(want) {
+		t.Fatal("Read:", n)
+	}
+	if string(got) != want {
+		t.Fatalf("Read: %q", got)
+	}
+
+	// Try to read one byte; confirm we're at the EOF.
+	var buf [1]byte
+	n, err = file.Read(buf[:])
+	if err != io.EOF {
+		t.Fatal("Read:", err)
+	}
+	if n != 0 {
+		t.Fatal("Read:", n)
+	}
+
+	// Use seek to get the offset at the EOF.
+	seeker := file.(io.Seeker)
+	off, err := seeker.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal("Seek:", err)
+	}
+	if off != int64(len(want)) {
+		t.Fatal("Seek:", off)
+	}
+
+	// Use ReadAt to read the entire file, ignoring the offset.
+	at := file.(io.ReaderAt)
+	got = make([]byte, len(want))
+	n, err = at.ReadAt(got, 0)
+	if err != nil {
+		t.Fatal("ReadAt:", err)
+	}
+	if n != len(want) {
+		t.Fatalf("ReadAt: got %d bytes, want %d bytes", n, len(want))
+	}
+	if string(got) != want {
+		t.Fatalf("ReadAt: got %q, want %q", got, want)
+	}
+
+	// Use ReadAt with non-zero offset.
+	off = int64(7)
+	want = want[off:]
+	got = make([]byte, len(want))
+	n, err = at.ReadAt(got, off)
+	if err != nil {
+		t.Fatal("ReadAt:", err)
+	}
+	if n != len(want) {
+		t.Fatalf("ReadAt: got %d bytes, want %d bytes", n, len(want))
+	}
+	if string(got) != want {
+		t.Fatalf("ReadAt: got %q, want %q", got, want)
 	}
 }

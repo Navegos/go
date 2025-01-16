@@ -40,14 +40,7 @@ h1 {
 .inlinesrc {
   color: #000066;
 }
-.deadsrc {
-cursor: pointer;
-}
-.deadsrc:hover {
-background-color: #eeeeee;
-}
 .livesrc {
-color: #0000ff;
 cursor: pointer;
 }
 .livesrc:hover {
@@ -76,8 +69,3 @@ function pprof_toggle_asm(e) {
   }
 }
 </script>`
-
-const weblistPageClosing = `
-</body>
-</html>
-`

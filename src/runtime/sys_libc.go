@@ -2,17 +2,20 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build darwin || (openbsd && amd64) || (openbsd && arm64)
-// +build darwin openbsd,amd64 openbsd,arm64
+//go:build darwin || (openbsd && !mips64)
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/runtime/sys"
+	"unsafe"
+)
 
 // Call fn with arg as its argument. Return what fn returns.
 // fn is the raw pc value of the entry point of the desired function.
 // Switches to the system stack, if not already there.
 // Preserves the calling point as the location where a profiler traceback will begin.
+//
 //go:nosplit
 func libcCall(fn, arg unsafe.Pointer) int32 {
 	// Leave caller's PC/SP/G around for traceback.
@@ -23,10 +26,10 @@ func libcCall(fn, arg unsafe.Pointer) int32 {
 	}
 	if mp != nil && mp.libcallsp == 0 {
 		mp.libcallg.set(gp)
-		mp.libcallpc = getcallerpc()
+		mp.libcallpc = sys.GetCallerPC()
 		// sp must be the last, because once async cpu profiler finds
 		// all three values to be non-zero, it will use them
-		mp.libcallsp = getcallersp()
+		mp.libcallsp = sys.GetCallerSP()
 	} else {
 		// Make sure we don't reset libcallsp. This makes
 		// libcCall reentrant; We remember the g/pc/sp for the

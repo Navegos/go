@@ -35,7 +35,7 @@ func openGoFile(f *os.File) (*File, error) {
 L:
 	for _, e := range a.Entries {
 		switch e.Type {
-		case archive.EntryPkgDef:
+		case archive.EntryPkgDef, archive.EntrySentinelNonObj:
 			continue
 		case archive.EntryGoObj:
 			o := e.Obj
@@ -164,11 +164,12 @@ func (f *goobjFile) symbols() ([]Sym, error) {
 		typ := objabi.SymKind(osym.Type())
 		var code rune = '?'
 		switch typ {
-		case objabi.STEXT:
+		case objabi.STEXT, objabi.STEXTFIPS:
 			code = 'T'
-		case objabi.SRODATA:
+		case objabi.SRODATA, objabi.SRODATAFIPS:
 			code = 'R'
-		case objabi.SDATA:
+		case objabi.SNOPTRDATA, objabi.SNOPTRDATAFIPS,
+			objabi.SDATA, objabi.SDATAFIPS:
 			code = 'D'
 		case objabi.SBSS, objabi.SNOPTRBSS, objabi.STLSBSS:
 			code = 'B'
@@ -250,26 +251,21 @@ func (f *goobjFile) PCToLine(pc uint64) (string, int, *gosym.Func) {
 		if pc < addr || pc >= addr+uint64(osym.Siz()) {
 			continue
 		}
-		isym := ^uint32(0)
-		auxs := r.Auxs(i)
-		for j := range auxs {
-			a := &auxs[j]
-			if a.Type() != goobj.AuxFuncInfo {
-				continue
+		var pcfileSym, pclineSym goobj.SymRef
+		for _, a := range r.Auxs(i) {
+			switch a.Type() {
+			case goobj.AuxPcfile:
+				pcfileSym = a.Sym()
+			case goobj.AuxPcline:
+				pclineSym = a.Sym()
 			}
-			if a.Sym().PkgIdx != goobj.PkgIdxSelf {
-				panic("funcinfo symbol not defined in current package")
-			}
-			isym = a.Sym().SymIdx
 		}
-		if isym == ^uint32(0) {
+		if pcfileSym.IsZero() || pclineSym.IsZero() {
 			continue
 		}
-		b := r.BytesAt(r.DataOff(isym), r.DataSize(isym))
-		var info *goobj.FuncInfo
-		pcline := getSymData(info.ReadPcline(b))
+		pcline := getSymData(pclineSym)
 		line := int(pcValue(pcline, pc-addr, f.arch))
-		pcfile := getSymData(info.ReadPcfile(b))
+		pcfile := getSymData(pcfileSym)
 		fileID := pcValue(pcfile, pc-addr, f.arch)
 		fileName := r.File(int(fileID))
 		// Note: we provide only the name in the Func structure.

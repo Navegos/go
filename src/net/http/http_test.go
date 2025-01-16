@@ -9,9 +9,12 @@ package http
 import (
 	"bytes"
 	"internal/testenv"
+	"io/fs"
 	"net/url"
-	"os/exec"
-	"reflect"
+	"os"
+	"regexp"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -38,37 +41,8 @@ func TestForeachHeaderElement(t *testing.T) {
 		foreachHeaderElement(tt.in, func(v string) {
 			got = append(got, v)
 		})
-		if !reflect.DeepEqual(got, tt.want) {
+		if !slices.Equal(got, tt.want) {
 			t.Errorf("foreachHeaderElement(%q) = %q; want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
-func TestCleanHost(t *testing.T) {
-	tests := []struct {
-		in, want string
-	}{
-		{"www.google.com", "www.google.com"},
-		{"www.google.com foo", "www.google.com"},
-		{"www.google.com/foo", "www.google.com"},
-		{" first character is a space", ""},
-		{"[1::6]:8080", "[1::6]:8080"},
-
-		// Punycode:
-		{"гофер.рф/foo", "xn--c1ae0ajs.xn--p1ai"},
-		{"bücher.de", "xn--bcher-kva.de"},
-		{"bücher.de:8080", "xn--bcher-kva.de:8080"},
-		// Verify we convert to lowercase before punycode:
-		{"BÜCHER.de", "xn--bcher-kva.de"},
-		{"BÜCHER.de:8080", "xn--bcher-kva.de:8080"},
-		// Verify we normalize to NFC before punycode:
-		{"gophér.nfc", "xn--gophr-esa.nfc"},            // NFC input; no work needed
-		{"goph\u0065\u0301r.nfd", "xn--gophr-esa.nfd"}, // NFD input
-	}
-	for _, tt := range tests {
-		got := cleanHost(tt.in)
-		if tt.want != got {
-			t.Errorf("cleanHost(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }
@@ -80,7 +54,7 @@ func TestCleanHost(t *testing.T) {
 func TestCmdGoNoHTTPServer(t *testing.T) {
 	t.Parallel()
 	goBin := testenv.GoToolPath(t)
-	out, err := exec.Command(goBin, "tool", "nm", goBin).CombinedOutput()
+	out, err := testenv.Command(t, goBin, "tool", "nm", goBin).CombinedOutput()
 	if err != nil {
 		t.Fatalf("go tool nm: %v: %s", err, out)
 	}
@@ -114,7 +88,7 @@ func TestOmitHTTP2(t *testing.T) {
 	}
 	t.Parallel()
 	goTool := testenv.GoToolPath(t)
-	out, err := exec.Command(goTool, "test", "-short", "-tags=nethttpomithttp2", "net/http").CombinedOutput()
+	out, err := testenv.Command(t, goTool, "test", "-short", "-tags=nethttpomithttp2", "net/http").CombinedOutput()
 	if err != nil {
 		t.Fatalf("go test -short failed: %v, %s", err, out)
 	}
@@ -126,7 +100,7 @@ func TestOmitHTTP2(t *testing.T) {
 func TestOmitHTTP2Vet(t *testing.T) {
 	t.Parallel()
 	goTool := testenv.GoToolPath(t)
-	out, err := exec.Command(goTool, "vet", "-tags=nethttpomithttp2", "net/http").CombinedOutput()
+	out, err := testenv.Command(t, goTool, "vet", "-tags=nethttpomithttp2", "net/http").CombinedOutput()
 	if err != nil {
 		t.Fatalf("go vet failed: %v, %s", err, out)
 	}
@@ -154,5 +128,93 @@ func BenchmarkCopyValues(b *testing.B) {
 	}
 	if valuesCount == 0 {
 		b.Fatal("Benchmark wasn't run")
+	}
+}
+
+var forbiddenStringsFunctions = map[string]bool{
+	// Functions that use Unicode-aware case folding.
+	"EqualFold":      true,
+	"Title":          true,
+	"ToLower":        true,
+	"ToLowerSpecial": true,
+	"ToTitle":        true,
+	"ToTitleSpecial": true,
+	"ToUpper":        true,
+	"ToUpperSpecial": true,
+
+	// Functions that use Unicode-aware spaces.
+	"Fields":    true,
+	"TrimSpace": true,
+}
+
+// TestNoUnicodeStrings checks that nothing in net/http uses the Unicode-aware
+// strings and bytes package functions. HTTP is mostly ASCII based, and doing
+// Unicode-aware case folding or space stripping can introduce vulnerabilities.
+func TestNoUnicodeStrings(t *testing.T) {
+	testenv.MustHaveSource(t)
+
+	re := regexp.MustCompile(`(strings|bytes).([A-Za-z]+)`)
+	if err := fs.WalkDir(os.DirFS("."), ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if path == "internal/ascii" {
+			return fs.SkipDir
+		}
+		if !strings.HasSuffix(path, ".go") ||
+			strings.HasSuffix(path, "_test.go") ||
+			path == "h2_bundle.go" || d.IsDir() {
+			return nil
+		}
+
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for lineNum, line := range strings.Split(string(contents), "\n") {
+			for _, match := range re.FindAllStringSubmatch(line, -1) {
+				if !forbiddenStringsFunctions[match[2]] {
+					continue
+				}
+				t.Errorf("disallowed call to %s at %s:%d", match[0], path, lineNum+1)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProtocols(t *testing.T) {
+	var p Protocols
+	if p.HTTP1() {
+		t.Errorf("zero-value protocols: p.HTTP1() = true, want false")
+	}
+	p.SetHTTP1(true)
+	p.SetHTTP2(true)
+	if !p.HTTP1() {
+		t.Errorf("initialized protocols: p.HTTP1() = false, want true")
+	}
+	if !p.HTTP2() {
+		t.Errorf("initialized protocols: p.HTTP2() = false, want true")
+	}
+	p.SetHTTP1(false)
+	if p.HTTP1() {
+		t.Errorf("after unsetting HTTP1: p.HTTP1() = true, want false")
+	}
+	if !p.HTTP2() {
+		t.Errorf("after unsetting HTTP1: p.HTTP2() = false, want true")
+	}
+}
+
+const redirectURL = "/thisaredirect细雪withasciilettersのけぶabcdefghijk.html"
+
+func BenchmarkHexEscapeNonASCII(b *testing.B) {
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		hexEscapeNonASCII(redirectURL)
 	}
 }

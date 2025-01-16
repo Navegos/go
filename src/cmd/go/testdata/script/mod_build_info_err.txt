@@ -11,8 +11,8 @@ stderr '^bad[/\\]bad.go:3:8: malformed import path "🐧.example.com/string": in
 
 # TODO(#41688): This should include a file and line, and report the reason for the error..
 # (Today it includes only an import stack.)
-! go get -d ./main
-stderr '^m/main imports\n\tm/bad imports\n\t🐧.example.com/string: malformed import path "🐧.example.com/string": invalid char ''🐧''$'
+! go get ./main
+stderr '^go: m/main imports\n\tm/bad imports\n\t🐧.example.com/string: malformed import path "🐧.example.com/string": invalid char ''🐧''$'
 
 
 -- go.mod --

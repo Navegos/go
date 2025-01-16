@@ -6,20 +6,16 @@ package ssa
 
 import (
 	"cmd/compile/internal/abi"
+	"cmd/compile/internal/base"
+	"cmd/compile/internal/ir"
+	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
+	"cmd/internal/obj"
 	"cmd/internal/src"
-	"crypto/sha1"
 	"fmt"
-	"io"
 	"math"
-	"os"
 	"strings"
 )
-
-type writeSyncer interface {
-	io.Writer
-	Sync() error
-}
 
 // A Func represents a Go func declaration (or function literal) and its body.
 // This package compiles each Func independently.
@@ -37,12 +33,8 @@ type Func struct {
 	bid idAlloc // block ID allocator
 	vid idAlloc // value ID allocator
 
-	// Given an environment variable used for debug hash match,
-	// what file (if any) receives the yes/no logging?
-	logfiles       map[string]writeSyncer
 	HTMLWriter     *HTMLWriter    // html writer, for debugging
-	DebugTest      bool           // default true unless $GOSSAHASH != ""; as a debugging aid, make new code conditional on this and use GOSSAHASH to binary search for failing cases
-	PrintOrHtmlSSA bool           // true if GOSSAFUNC matches, true even if fe.Log() (spew phase results to stdout) is false.
+	PrintOrHtmlSSA bool           // true if GOSSAFUNC matches, true even if fe.Log() (spew phase results to stdout) is false.  There's an odd dependence on this in debug.go for method logf.
 	ruleMatches    map[string]int // number of times countRule was called during compilation for any given string
 	ABI0           *abi.ABIConfig // A copy, for no-sync access
 	ABI1           *abi.ABIConfig // A copy, for no-sync access
@@ -53,26 +45,31 @@ type Func struct {
 	laidout     bool  // Blocks are ordered
 	NoSplit     bool  // true if function is marked as nosplit.  Used by schedule check pass.
 	dumpFileSeq uint8 // the sequence numbers of dump file. (%s_%02d__%s.dump", funcname, dumpFileSeq, phaseName)
+	IsPgoHot    bool
 
 	// when register allocation is done, maps value ids to locations
 	RegAlloc []Location
+
+	// temporary registers allocated to rare instructions
+	tempRegs map[ID]*Register
 
 	// map from LocalSlot to set of Values that we want to store in that slot.
 	NamedValues map[LocalSlot][]*Value
 	// Names is a copy of NamedValues.Keys. We keep a separate list
 	// of keys to make iteration order deterministic.
-	Names []LocalSlot
+	Names []*LocalSlot
+	// Canonicalize root/top-level local slots, and canonicalize their pieces.
+	// Because LocalSlot pieces refer to their parents with a pointer, this ensures that equivalent slots really are equal.
+	CanonicalLocalSlots  map[LocalSlot]*LocalSlot
+	CanonicalLocalSplits map[LocalSlotSplitKey]*LocalSlot
 
 	// RegArgs is a slice of register-memory pairs that must be spilled and unspilled in the uncommon path of function entry.
 	RegArgs []Spill
-	// AuxCall describing parameters and results for this function.
+	// OwnAux describes parameters and results for this function.
 	OwnAux *AuxCall
-
-	// WBLoads is a list of Blocks that branch on the write
-	// barrier flag. Safe-points are disabled from the OpLoad that
-	// reads the write-barrier flag until the control flow rejoins
-	// below the two successors of this block.
-	WBLoads []*Block
+	// CloSlot holds the compiler-synthesized name (".closureptr")
+	// where we spill the closure pointer for range func bodies.
+	CloSlot *ir.Name
 
 	freeValues *Value // free Values linked by argstorage[0].  All other fields except ID are 0/nil.
 	freeBlocks *Block // free Blocks linked by succstorage[0].b.  All other fields except ID are 0/nil.
@@ -87,10 +84,24 @@ type Func struct {
 	constants map[int64][]*Value // constants cache, keyed by constant value; users must check value's Op and Type
 }
 
+type LocalSlotSplitKey struct {
+	parent *LocalSlot
+	Off    int64       // offset of slot in N
+	Type   *types.Type // type of slot
+}
+
 // NewFunc returns a new, empty function object.
-// Caller must set f.Config and f.Cache before using f.
-func NewFunc(fe Frontend) *Func {
-	return &Func{fe: fe, NamedValues: make(map[LocalSlot][]*Value)}
+// Caller must reset cache before calling NewFunc.
+func (c *Config) NewFunc(fe Frontend, cache *Cache) *Func {
+	return &Func{
+		fe:     fe,
+		Config: c,
+		Cache:  cache,
+
+		NamedValues:          make(map[LocalSlot][]*Value),
+		CanonicalLocalSlots:  make(map[LocalSlot]*LocalSlot),
+		CanonicalLocalSplits: make(map[LocalSlotSplitKey]*LocalSlot),
+	}
 }
 
 // NumBlocks returns an integer larger than the id of any Block in the Func.
@@ -103,52 +114,52 @@ func (f *Func) NumValues() int {
 	return f.vid.num()
 }
 
+// NameABI returns the function name followed by comma and the ABI number.
+// This is intended for use with GOSSAFUNC and HTML dumps, and differs from
+// the linker's "<1>" convention because "<" and ">" require shell quoting
+// and are not legal file names (for use with GOSSADIR) on Windows.
+func (f *Func) NameABI() string {
+	return FuncNameABI(f.Name, f.ABISelf.Which())
+}
+
+// FuncNameABI returns n followed by a comma and the value of a.
+// This is a separate function to allow a single point encoding
+// of the format, which is used in places where there's not a Func yet.
+func FuncNameABI(n string, a obj.ABI) string {
+	return fmt.Sprintf("%s,%d", n, a)
+}
+
 // newSparseSet returns a sparse set that can store at least up to n integers.
 func (f *Func) newSparseSet(n int) *sparseSet {
-	for i, scr := range f.Cache.scrSparseSet {
-		if scr != nil && scr.cap() >= n {
-			f.Cache.scrSparseSet[i] = nil
-			scr.clear()
-			return scr
-		}
-	}
-	return newSparseSet(n)
+	return f.Cache.allocSparseSet(n)
 }
 
 // retSparseSet returns a sparse set to the config's cache of sparse
 // sets to be reused by f.newSparseSet.
 func (f *Func) retSparseSet(ss *sparseSet) {
-	for i, scr := range f.Cache.scrSparseSet {
-		if scr == nil {
-			f.Cache.scrSparseSet[i] = ss
-			return
-		}
-	}
-	f.Cache.scrSparseSet = append(f.Cache.scrSparseSet, ss)
+	f.Cache.freeSparseSet(ss)
 }
 
 // newSparseMap returns a sparse map that can store at least up to n integers.
 func (f *Func) newSparseMap(n int) *sparseMap {
-	for i, scr := range f.Cache.scrSparseMap {
-		if scr != nil && scr.cap() >= n {
-			f.Cache.scrSparseMap[i] = nil
-			scr.clear()
-			return scr
-		}
-	}
-	return newSparseMap(n)
+	return f.Cache.allocSparseMap(n)
 }
 
 // retSparseMap returns a sparse map to the config's cache of sparse
 // sets to be reused by f.newSparseMap.
 func (f *Func) retSparseMap(ss *sparseMap) {
-	for i, scr := range f.Cache.scrSparseMap {
-		if scr == nil {
-			f.Cache.scrSparseMap[i] = ss
-			return
-		}
-	}
-	f.Cache.scrSparseMap = append(f.Cache.scrSparseMap, ss)
+	f.Cache.freeSparseMap(ss)
+}
+
+// newSparseMapPos returns a sparse map that can store at least up to n integers.
+func (f *Func) newSparseMapPos(n int) *sparseMapPos {
+	return f.Cache.allocSparseMapPos(n)
+}
+
+// retSparseMapPos returns a sparse map to the config's cache of sparse
+// sets to be reused by f.newSparseMapPos.
+func (f *Func) retSparseMapPos(ss *sparseMapPos) {
+	f.Cache.freeSparseMapPos(ss)
 }
 
 // newPoset returns a new poset from the internal cache
@@ -166,31 +177,99 @@ func (f *Func) retPoset(po *poset) {
 	f.Cache.scrPoset = append(f.Cache.scrPoset, po)
 }
 
-// newDeadcodeLive returns a slice for the
-// deadcode pass to use to indicate which values are live.
-func (f *Func) newDeadcodeLive() []bool {
-	r := f.Cache.deadcode.live
-	f.Cache.deadcode.live = nil
-	return r
+func (f *Func) localSlotAddr(slot LocalSlot) *LocalSlot {
+	a, ok := f.CanonicalLocalSlots[slot]
+	if !ok {
+		a = new(LocalSlot)
+		*a = slot // don't escape slot
+		f.CanonicalLocalSlots[slot] = a
+	}
+	return a
 }
 
-// retDeadcodeLive returns a deadcode live value slice for re-use.
-func (f *Func) retDeadcodeLive(live []bool) {
-	f.Cache.deadcode.live = live
+func (f *Func) SplitString(name *LocalSlot) (*LocalSlot, *LocalSlot) {
+	ptrType := types.NewPtr(types.Types[types.TUINT8])
+	lenType := types.Types[types.TINT]
+	// Split this string up into two separate variables.
+	p := f.SplitSlot(name, ".ptr", 0, ptrType)
+	l := f.SplitSlot(name, ".len", ptrType.Size(), lenType)
+	return p, l
 }
 
-// newDeadcodeLiveOrderStmts returns a slice for the
-// deadcode pass to use to indicate which values
-// need special treatment for statement boundaries.
-func (f *Func) newDeadcodeLiveOrderStmts() []*Value {
-	r := f.Cache.deadcode.liveOrderStmts
-	f.Cache.deadcode.liveOrderStmts = nil
-	return r
+func (f *Func) SplitInterface(name *LocalSlot) (*LocalSlot, *LocalSlot) {
+	n := name.N
+	u := types.Types[types.TUINTPTR]
+	t := types.NewPtr(types.Types[types.TUINT8])
+	// Split this interface up into two separate variables.
+	sfx := ".itab"
+	if n.Type().IsEmptyInterface() {
+		sfx = ".type"
+	}
+	c := f.SplitSlot(name, sfx, 0, u) // see comment in typebits.Set
+	d := f.SplitSlot(name, ".data", u.Size(), t)
+	return c, d
 }
 
-// retDeadcodeLiveOrderStmts returns a deadcode liveOrderStmts slice for re-use.
-func (f *Func) retDeadcodeLiveOrderStmts(liveOrderStmts []*Value) {
-	f.Cache.deadcode.liveOrderStmts = liveOrderStmts
+func (f *Func) SplitSlice(name *LocalSlot) (*LocalSlot, *LocalSlot, *LocalSlot) {
+	ptrType := types.NewPtr(name.Type.Elem())
+	lenType := types.Types[types.TINT]
+	p := f.SplitSlot(name, ".ptr", 0, ptrType)
+	l := f.SplitSlot(name, ".len", ptrType.Size(), lenType)
+	c := f.SplitSlot(name, ".cap", ptrType.Size()+lenType.Size(), lenType)
+	return p, l, c
+}
+
+func (f *Func) SplitComplex(name *LocalSlot) (*LocalSlot, *LocalSlot) {
+	s := name.Type.Size() / 2
+	var t *types.Type
+	if s == 8 {
+		t = types.Types[types.TFLOAT64]
+	} else {
+		t = types.Types[types.TFLOAT32]
+	}
+	r := f.SplitSlot(name, ".real", 0, t)
+	i := f.SplitSlot(name, ".imag", t.Size(), t)
+	return r, i
+}
+
+func (f *Func) SplitInt64(name *LocalSlot) (*LocalSlot, *LocalSlot) {
+	var t *types.Type
+	if name.Type.IsSigned() {
+		t = types.Types[types.TINT32]
+	} else {
+		t = types.Types[types.TUINT32]
+	}
+	if f.Config.BigEndian {
+		return f.SplitSlot(name, ".hi", 0, t), f.SplitSlot(name, ".lo", t.Size(), types.Types[types.TUINT32])
+	}
+	return f.SplitSlot(name, ".hi", t.Size(), t), f.SplitSlot(name, ".lo", 0, types.Types[types.TUINT32])
+}
+
+func (f *Func) SplitStruct(name *LocalSlot, i int) *LocalSlot {
+	st := name.Type
+	return f.SplitSlot(name, st.FieldName(i), st.FieldOff(i), st.FieldType(i))
+}
+func (f *Func) SplitArray(name *LocalSlot) *LocalSlot {
+	n := name.N
+	at := name.Type
+	if at.NumElem() != 1 {
+		base.FatalfAt(n.Pos(), "bad array size")
+	}
+	et := at.Elem()
+	return f.SplitSlot(name, "[0]", 0, et)
+}
+
+func (f *Func) SplitSlot(name *LocalSlot, sfx string, offset int64, t *types.Type) *LocalSlot {
+	lssk := LocalSlotSplitKey{name, offset, t}
+	if als, ok := f.CanonicalLocalSplits[lssk]; ok {
+		return als
+	}
+	// Note: the _ field may appear several times.  But
+	// have no fear, identically-named but distinct Autos are
+	// ok, albeit maybe confusing for a debugger.
+	ls := f.fe.SplitSlot(name, sfx, offset, t)
+	f.CanonicalLocalSplits[lssk] = &ls
+	return &ls
 }
 
 // newValue allocates a new Value with the given fields and places it at the end of b.Values.
@@ -249,7 +328,7 @@ func (f *Func) newValueNoBlock(op Op, t *types.Type, pos src.XPos) *Value {
 	return v
 }
 
-// logPassStat writes a string key and int value as a warning in a
+// LogStat writes a string key and int value as a warning in a
 // tab-separated format easily handled by spreadsheets or awk.
 // file names, lines, and function names are included to provide enough (?)
 // context to allow item-by-item comparisons across runs.
@@ -332,7 +411,7 @@ func (f *Func) freeValue(v *Value) {
 	f.freeValues = v
 }
 
-// newBlock allocates a new Block of the given kind and places it at the end of f.Blocks.
+// NewBlock allocates a new Block of the given kind and places it at the end of f.Blocks.
 func (f *Func) NewBlock(kind BlockKind) *Block {
 	var b *Block
 	if f.freeBlocks != nil {
@@ -378,7 +457,7 @@ func (b *Block) NewValue0(pos src.XPos, op Op, t *types.Type) *Value {
 	return v
 }
 
-// NewValue returns a new value in the block with no arguments and an auxint value.
+// NewValue0I returns a new value in the block with no arguments and an auxint value.
 func (b *Block) NewValue0I(pos src.XPos, op Op, t *types.Type, auxint int64) *Value {
 	v := b.Func.newValue(op, t, b, pos)
 	v.AuxInt = auxint
@@ -386,7 +465,7 @@ func (b *Block) NewValue0I(pos src.XPos, op Op, t *types.Type, auxint int64) *Va
 	return v
 }
 
-// NewValue returns a new value in the block with no arguments and an aux value.
+// NewValue0A returns a new value in the block with no arguments and an aux value.
 func (b *Block) NewValue0A(pos src.XPos, op Op, t *types.Type, aux Aux) *Value {
 	v := b.Func.newValue(op, t, b, pos)
 	v.AuxInt = 0
@@ -395,7 +474,7 @@ func (b *Block) NewValue0A(pos src.XPos, op Op, t *types.Type, aux Aux) *Value {
 	return v
 }
 
-// NewValue returns a new value in the block with no arguments and both an auxint and aux values.
+// NewValue0IA returns a new value in the block with no arguments and both an auxint and aux values.
 func (b *Block) NewValue0IA(pos src.XPos, op Op, t *types.Type, auxint int64, aux Aux) *Value {
 	v := b.Func.newValue(op, t, b, pos)
 	v.AuxInt = auxint
@@ -599,7 +678,7 @@ const (
 	constEmptyStringMagic = 4455667788
 )
 
-// ConstInt returns an int constant representing its argument.
+// ConstBool returns an int constant representing its argument.
 func (f *Func) ConstBool(t *types.Type, c bool) *Value {
 	i := int64(0)
 	if c {
@@ -646,7 +725,6 @@ func (f *Func) ConstOffPtrSP(t *types.Type, c int64, sp *Value) *Value {
 		v.AddArg(sp)
 	}
 	return v
-
 }
 
 func (f *Func) Frontend() Frontend                                  { return f.fe }
@@ -713,83 +791,19 @@ func (f *Func) invalidateCFG() {
 	f.cachedLoopnest = nil
 }
 
-// DebugHashMatch reports whether environment variable evname
-// 1) is empty (this is a special more-quickly implemented case of 3)
-// 2) is "y" or "Y"
-// 3) is a suffix of the sha1 hash of name
-// 4) is a suffix of the environment variable
-//    fmt.Sprintf("%s%d", evname, n)
-//    provided that all such variables are nonempty for 0 <= i <= n
-// Otherwise it returns false.
-// When true is returned the message
-//  "%s triggered %s\n", evname, name
-// is printed on the file named in environment variable
-//  GSHS_LOGFILE
-// or standard out if that is empty or there is an error
-// opening the file.
-func (f *Func) DebugHashMatch(evname string) bool {
-	name := f.fe.MyImportPath() + "." + f.Name
-	evhash := os.Getenv(evname)
-	switch evhash {
-	case "":
-		return true // default behavior with no EV is "on"
-	case "y", "Y":
-		f.logDebugHashMatch(evname, name)
-		return true
-	case "n", "N":
-		return false
-	}
-	// Check the hash of the name against a partial input hash.
-	// We use this feature to do a binary search to
-	// find a function that is incorrectly compiled.
-	hstr := ""
-	for _, b := range sha1.Sum([]byte(name)) {
-		hstr += fmt.Sprintf("%08b", b)
-	}
-
-	if strings.HasSuffix(hstr, evhash) {
-		f.logDebugHashMatch(evname, name)
+// DebugHashMatch returns
+//
+//	base.DebugHashMatch(this function's package.name)
+//
+// for use in bug isolation.  The return value is true unless
+// environment variable GOCOMPILEDEBUG=gossahash=X is set, in which case "it depends on X".
+// See [base.DebugHashMatch] for more information.
+func (f *Func) DebugHashMatch() bool {
+	if !base.HasDebugHash() {
 		return true
 	}
-
-	// Iteratively try additional hashes to allow tests for multi-point
-	// failure.
-	for i := 0; true; i++ {
-		ev := fmt.Sprintf("%s%d", evname, i)
-		evv := os.Getenv(ev)
-		if evv == "" {
-			break
-		}
-		if strings.HasSuffix(hstr, evv) {
-			f.logDebugHashMatch(ev, name)
-			return true
-		}
-	}
-	return false
-}
-
-func (f *Func) logDebugHashMatch(evname, name string) {
-	if f.logfiles == nil {
-		f.logfiles = make(map[string]writeSyncer)
-	}
-	file := f.logfiles[evname]
-	if file == nil {
-		file = os.Stdout
-		if tmpfile := os.Getenv("GSHS_LOGFILE"); tmpfile != "" {
-			var err error
-			file, err = os.OpenFile(tmpfile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-			if err != nil {
-				f.Fatalf("could not open hash-testing logfile %s", tmpfile)
-			}
-		}
-		f.logfiles[evname] = file
-	}
-	fmt.Fprintf(file, "%s triggered %s\n", evname, name)
-	file.Sync()
-}
-
-func DebugNameMatch(evname, name string) bool {
-	return os.Getenv(evname) == name
+	sym := f.fe.Func().Sym()
+	return base.DebugHashMatchPkgFunc(sym.Pkg.Path, sym.Name)
 }
 
 func (f *Func) spSb() (sp, sb *Value) {
@@ -812,4 +826,41 @@ func (f *Func) spSb() (sp, sb *Value) {
 		sp = f.Entry.NewValue0(initpos.WithNotStmt(), OpSP, f.Config.Types.Uintptr)
 	}
 	return
+}
+
+// useFMA allows targeted debugging w/ GOFMAHASH
+// If you have an architecture-dependent FP glitch, this will help you find it.
+func (f *Func) useFMA(v *Value) bool {
+	if !f.Config.UseFMA {
+		return false
+	}
+	if base.FmaHash == nil {
+		return true
+	}
+	return base.FmaHash.MatchPos(v.Pos, nil)
+}
+
+// NewLocal returns a new anonymous local variable of the given type.
+func (f *Func) NewLocal(pos src.XPos, typ *types.Type) *ir.Name {
+	nn := typecheck.TempAt(pos, f.fe.Func(), typ) // Note: adds new auto to fn.Dcl list
+	nn.SetNonMergeable(true)
+	return nn
+}
+
+// IsMergeCandidate returns true if variable n could participate in
+// stack slot merging. For now we're restricting the set to things to
+// items larger than what CanSSA would allow (approximateky, we disallow things
+// marked as open defer slots so as to avoid complicating liveness
+// analysis.
+func IsMergeCandidate(n *ir.Name) bool {
+	if base.Debug.MergeLocals == 0 ||
+		base.Flag.N != 0 ||
+		n.Class != ir.PAUTO ||
+		n.Type().Size() <= int64(3*types.PtrSize) ||
+		n.Addrtaken() ||
+		n.NonMergeable() ||
+		n.OpenDeferSlot() {
+		return false
+	}
+	return true
 }

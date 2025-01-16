@@ -32,19 +32,19 @@ const (
 )
 
 // Writer is an LZW compressor. It writes the compressed form of the data
-// to an underlying writer (see NewWriter).
+// to an underlying writer (see [NewWriter]).
 type Writer struct {
 	// w is the writer that compressed bytes are written to.
 	w writer
+	// litWidth is the width in bits of literal codes.
+	litWidth uint
 	// order, write, bits, nBits and width are the state for
 	// converting a code stream into a byte stream.
 	order Order
 	write func(*Writer, uint32) error
-	bits  uint32
 	nBits uint
 	width uint
-	// litWidth is the width in bits of literal codes.
-	litWidth uint
+	bits  uint32
 	// hi is the code implied by the next code emission.
 	// overflow is the code at which hi overflows the code width.
 	hi, overflow uint32
@@ -137,7 +137,19 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 	n = len(p)
 	code := w.savedCode
 	if code == invalidCode {
-		// The first code sent is always a literal code.
+		// This is the first write; send a clear code.
+		// https://www.w3.org/Graphics/GIF/spec-gif89a.txt Appendix F
+		// "Variable-Length-Code LZW Compression" says that "Encoders should
+		// output a Clear code as the first code of each image data stream".
+		//
+		// LZW compression isn't only used by GIF, but it's cheap to follow
+		// that directive unconditionally.
+		clear := uint32(1) << w.litWidth
+		if err := w.write(w, clear); err != nil {
+			return 0, err
+		}
+		// After the starting clear code, the next code sent (for non-empty
+		// input) is always a literal code.
 		code, p = uint32(p[0]), p[1:]
 	}
 loop:
@@ -183,7 +195,7 @@ loop:
 	return n, nil
 }
 
-// Close closes the Writer, flushing any pending output. It does not close
+// Close closes the [Writer], flushing any pending output. It does not close
 // w's underlying writer.
 func (w *Writer) Close() error {
 	if w.err != nil {
@@ -200,6 +212,12 @@ func (w *Writer) Close() error {
 			return err
 		}
 		if err := w.incHi(); err != nil && err != errOutOfCodes {
+			return err
+		}
+	} else {
+		// Write the starting clear code, as w.Write did not.
+		clear := uint32(1) << w.litWidth
+		if err := w.write(w, clear); err != nil {
 			return err
 		}
 	}
@@ -220,22 +238,22 @@ func (w *Writer) Close() error {
 	return w.w.Flush()
 }
 
-// Reset clears the Writer's state and allows it to be reused again
-// as a new Writer.
+// Reset clears the [Writer]'s state and allows it to be reused again
+// as a new [Writer].
 func (w *Writer) Reset(dst io.Writer, order Order, litWidth int) {
 	*w = Writer{}
 	w.init(dst, order, litWidth)
 }
 
-// NewWriter creates a new io.WriteCloser.
-// Writes to the returned io.WriteCloser are compressed and written to w.
+// NewWriter creates a new [io.WriteCloser].
+// Writes to the returned [io.WriteCloser] are compressed and written to w.
 // It is the caller's responsibility to call Close on the WriteCloser when
 // finished writing.
 // The number of bits to use for literal codes, litWidth, must be in the
 // range [2,8] and is typically 8. Input bytes must be less than 1<<litWidth.
 //
-// It is guaranteed that the underlying type of the returned io.WriteCloser
-// is a *Writer.
+// It is guaranteed that the underlying type of the returned [io.WriteCloser]
+// is a *[Writer].
 func NewWriter(w io.Writer, order Order, litWidth int) io.WriteCloser {
 	return newWriter(w, order, litWidth)
 }

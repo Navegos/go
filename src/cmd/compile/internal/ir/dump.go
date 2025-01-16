@@ -20,12 +20,12 @@ import (
 	"cmd/internal/src"
 )
 
-// dump is like fdump but prints to stderr.
+// DumpAny is like FDumpAny but prints to stderr.
 func DumpAny(root interface{}, filter string, depth int) {
 	FDumpAny(os.Stderr, root, filter, depth)
 }
 
-// fdump prints the structure of a rooted data structure
+// FDumpAny prints the structure of a rooted data structure
 // to w by depth-first traversal of the data structure.
 //
 // The filter parameter is a regular expression. If it is
@@ -218,7 +218,7 @@ func (p *dumper) dump(x reflect.Value, depth int) {
 					continue // Op field already printed for Nodes
 				}
 				x := x.Field(i)
-				if isZeroVal(x) {
+				if x.IsZero() {
 					omitted = true
 					continue // exclude zero-valued fields
 				}
@@ -246,22 +246,6 @@ func (p *dumper) dump(x reflect.Value, depth int) {
 	default:
 		p.printf("%v", x.Interface())
 	}
-}
-
-func isZeroVal(x reflect.Value) bool {
-	switch x.Kind() {
-	case reflect.Bool:
-		return !x.Bool()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return x.Int() == 0
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return x.Uint() == 0
-	case reflect.String:
-		return x.String() == ""
-	case reflect.Interface, reflect.Ptr, reflect.Slice:
-		return x.IsNil()
-	}
-	return false
 }
 
 func commonPrefixLen(a, b string) (i int) {

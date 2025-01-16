@@ -3,15 +3,15 @@
 // license that can be found in the LICENSE file.
 
 // Pool is no-op under race detector, so all these tests do not work.
+//
 //go:build !race
-// +build !race
 
 package sync_test
 
 import (
 	"runtime"
 	"runtime/debug"
-	"sort"
+	"slices"
 	. "sync"
 	"sync/atomic"
 	"testing"
@@ -65,7 +65,7 @@ func TestPoolNew(t *testing.T) {
 
 	i := 0
 	p := Pool{
-		New: func() interface{} {
+		New: func() any {
 			i++
 			return i
 		},
@@ -144,7 +144,7 @@ func TestPoolStress(t *testing.T) {
 	done := make(chan bool)
 	for i := 0; i < P; i++ {
 		go func() {
-			var v interface{} = 0
+			var v any = 0
 			for j := 0; j < N; j++ {
 				if v == nil {
 					v = 0
@@ -247,6 +247,28 @@ func testPoolDequeue(t *testing.T, d PoolDequeue) {
 	}
 }
 
+func TestNilPool(t *testing.T) {
+	catch := func() {
+		if recover() == nil {
+			t.Error("expected panic")
+		}
+	}
+
+	var p *Pool
+	t.Run("Get", func(t *testing.T) {
+		defer catch()
+		if p.Get() != nil {
+			t.Error("expected empty")
+		}
+		t.Error("should have panicked already")
+	})
+	t.Run("Put", func(t *testing.T) {
+		defer catch()
+		p.Put("a")
+		t.Error("should have panicked already")
+	})
+}
+
 func BenchmarkPool(b *testing.B) {
 	var p Pool
 	b.RunParallel(func(pb *testing.PB) {
@@ -271,7 +293,27 @@ func BenchmarkPoolOverflow(b *testing.B) {
 	})
 }
 
-var globalSink interface{}
+// Simulate object starvation in order to force Ps to steal objects
+// from other Ps.
+func BenchmarkPoolStarvation(b *testing.B) {
+	var p Pool
+	count := 100
+	// Reduce number of putted objects by 33 %. It creates objects starvation
+	// that force P-local storage to steal objects from other Ps.
+	countStarved := count - int(float32(count)*0.33)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			for b := 0; b < countStarved; b++ {
+				p.Put(1)
+			}
+			for b := 0; b < count; b++ {
+				p.Get()
+			}
+		}
+	})
+}
+
+var globalSink any
 
 func BenchmarkPoolSTW(b *testing.B) {
 	// Take control of GC.
@@ -284,7 +326,7 @@ func BenchmarkPoolSTW(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Put a large number of items into a pool.
 		const N = 100000
-		var item interface{} = 42
+		var item any = 42
 		for i := 0; i < N; i++ {
 			p.Put(item)
 		}
@@ -296,7 +338,7 @@ func BenchmarkPoolSTW(b *testing.B) {
 	}
 
 	// Get pause time stats.
-	sort.Slice(pauses, func(i, j int) bool { return pauses[i] < pauses[j] })
+	slices.Sort(pauses)
 	var total uint64
 	for _, ns := range pauses {
 		total += ns
@@ -319,7 +361,7 @@ func BenchmarkPoolExpensiveNew(b *testing.B) {
 	// Create a pool that's "expensive" to fill.
 	var p Pool
 	var nNew uint64
-	p.New = func() interface{} {
+	p.New = func() any {
 		atomic.AddUint64(&nNew, 1)
 		time.Sleep(time.Millisecond)
 		return 42
@@ -329,7 +371,7 @@ func BenchmarkPoolExpensiveNew(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		// Simulate 100X the number of goroutines having items
 		// checked out from the Pool simultaneously.
-		items := make([]interface{}, 100)
+		items := make([]any, 100)
 		var sink []byte
 		for pb.Next() {
 			// Stress the pool.

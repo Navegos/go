@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !aix && !darwin && !freebsd && !openbsd && !solaris && !windows
-// +build !aix,!darwin,!freebsd,!openbsd,!solaris,!windows
+//go:build !aix && !darwin && !freebsd && !openbsd && !solaris && !wasip1 && !windows && !(linux && amd64)
 
 package runtime
 
-func walltime1() (sec int64, nsec int32)
+//go:wasmimport gojs runtime.walltime
+func walltime() (sec int64, nsec int32)

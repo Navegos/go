@@ -20,6 +20,7 @@ package driver
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -59,9 +60,8 @@ func PProf(eo *plugin.Options) error {
 	return interactive(p, o)
 }
 
+// generateRawReport is allowed to modify p.
 func generateRawReport(p *profile.Profile, cmd []string, cfg config, o *plugin.Options) (*command, *report.Report, error) {
-	p = p.Copy() // Prevent modification to the incoming profile.
-
 	// Identify units of numeric tags in profile.
 	numLabelUnits := identifyNumLabelUnits(p, o.UI)
 
@@ -72,6 +72,10 @@ func generateRawReport(p *profile.Profile, cmd []string, cfg config, o *plugin.O
 	}
 
 	cfg = applyCommandOverrides(cmd[0], c.format, cfg)
+
+	// Create label pseudo nodes before filtering, in case the filters use
+	// the generated nodes.
+	generateTagRootsLeaves(p, cfg, o.UI)
 
 	// Delay focus after configuring report to get percentages on all samples.
 	relative := cfg.RelativePercentages
@@ -106,6 +110,7 @@ func generateRawReport(p *profile.Profile, cmd []string, cfg config, o *plugin.O
 	return c, rpt, nil
 }
 
+// generateReport is allowed to modify p.
 func generateReport(p *profile.Profile, cmd []string, cfg config, o *plugin.Options) error {
 	c, rpt, err := generateRawReport(p, cmd, cfg, o)
 	if err != nil {
@@ -114,7 +119,14 @@ func generateReport(p *profile.Profile, cmd []string, cfg config, o *plugin.Opti
 
 	// Generate the report.
 	dst := new(bytes.Buffer)
-	if err := report.Generate(dst, rpt, o.Obj); err != nil {
+	switch rpt.OutputFormat() {
+	case report.WebList:
+		// We need template expansion, so generate here instead of in report.
+		err = printWebList(dst, rpt, o.Obj)
+	default:
+		err = report.Generate(dst, rpt, o.Obj)
+	}
+	if err != nil {
 		return err
 	}
 	src := dst
@@ -149,6 +161,18 @@ func generateReport(p *profile.Profile, cmd []string, cfg config, o *plugin.Opti
 		return err
 	}
 	return out.Close()
+}
+
+func printWebList(dst io.Writer, rpt *report.Report, obj plugin.ObjTool) error {
+	listing, err := report.MakeWebList(rpt, obj, -1)
+	if err != nil {
+		return err
+	}
+	legend := report.ProfileLabels(rpt)
+	return renderHTML(dst, "sourcelisting", rpt, nil, legend, webArgs{
+		Standalone: true,
+		Listing:    listing,
+	})
 }
 
 func applyCommandOverrides(cmd string, outputFormat int, cfg config) config {
@@ -197,7 +221,6 @@ func applyCommandOverrides(cmd string, outputFormat int, cfg config) config {
 	case report.Proto, report.Raw, report.Callgrind:
 		trim = false
 		cfg.Granularity = "addresses"
-		cfg.NoInlines = false
 	}
 
 	if !trim {
@@ -208,10 +231,31 @@ func applyCommandOverrides(cmd string, outputFormat int, cfg config) config {
 	return cfg
 }
 
+// generateTagRootsLeaves generates extra nodes from the tagroot and tagleaf options.
+func generateTagRootsLeaves(prof *profile.Profile, cfg config, ui plugin.UI) {
+	tagRootLabelKeys := dropEmptyStrings(strings.Split(cfg.TagRoot, ","))
+	tagLeafLabelKeys := dropEmptyStrings(strings.Split(cfg.TagLeaf, ","))
+	rootm, leafm := addLabelNodes(prof, tagRootLabelKeys, tagLeafLabelKeys, cfg.Unit)
+	warnNoMatches(cfg.TagRoot == "" || rootm, "TagRoot", ui)
+	warnNoMatches(cfg.TagLeaf == "" || leafm, "TagLeaf", ui)
+}
+
+// dropEmptyStrings filters a slice to only non-empty strings
+func dropEmptyStrings(in []string) (out []string) {
+	for _, s := range in {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return
+}
+
 func aggregate(prof *profile.Profile, cfg config) error {
 	var function, filename, linenumber, address bool
 	inlines := !cfg.NoInlines
 	switch cfg.Granularity {
+	case "":
+		function = true // Default granularity is "functions"
 	case "addresses":
 		if inlines {
 			return nil
@@ -234,7 +278,7 @@ func aggregate(prof *profile.Profile, cfg config) error {
 	default:
 		return fmt.Errorf("unexpected granularity")
 	}
-	return prof.Aggregate(inlines, function, filename, linenumber, address)
+	return prof.Aggregate(inlines, function, filename, linenumber, cfg.ShowColumns, address)
 }
 
 func reportOptions(p *profile.Profile, numLabelUnits map[string]string, cfg config) (*report.Options, error) {
@@ -341,4 +385,24 @@ func valueExtractor(ix int) sampleValueFunc {
 	return func(v []int64) int64 {
 		return v[ix]
 	}
+}
+
+// profileCopier can be used to obtain a fresh copy of a profile.
+// It is useful since reporting code may mutate the profile handed to it.
+type profileCopier []byte
+
+func makeProfileCopier(src *profile.Profile) profileCopier {
+	// Pre-serialize the profile. We will deserialize every time a fresh copy is needed.
+	var buf bytes.Buffer
+	src.WriteUncompressed(&buf)
+	return profileCopier(buf.Bytes())
+}
+
+// newCopy returns a new copy of the profile.
+func (c profileCopier) newCopy() *profile.Profile {
+	p, err := profile.ParseUncompressed([]byte(c))
+	if err != nil {
+		panic(err)
+	}
+	return p
 }

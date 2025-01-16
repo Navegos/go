@@ -8,12 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"internal/buildcfg"
-	"io"
+	"internal/exportdata"
+	"internal/pkgbits"
 	"os"
 	pathpkg "path"
 	"runtime"
-	"sort"
-	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -21,19 +20,16 @@ import (
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/importer"
 	"cmd/compile/internal/ir"
-	"cmd/compile/internal/syntax"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/compile/internal/types2"
-	"cmd/internal/archive"
 	"cmd/internal/bio"
 	"cmd/internal/goobj"
 	"cmd/internal/objabi"
-	"cmd/internal/src"
 )
 
-// Temporary import helper to get type2-based type-checking going.
 type gcimports struct {
+	ctxt     *types2.Context
 	packages map[string]*types2.Package
 }
 
@@ -46,13 +42,8 @@ func (m *gcimports) ImportFrom(path, srcDir string, mode types2.ImportMode) (*ty
 		panic("mode must be 0")
 	}
 
-	path, err := resolveImportPath(path)
-	if err != nil {
-		return nil, err
-	}
-
-	lookup := func(path string) (io.ReadCloser, error) { return openPackage(path) }
-	return importer.Import(m.packages, path, srcDir, lookup)
+	_, pkg, err := readImportFile(path, typecheck.Target, m.ctxt, m.packages)
+	return pkg, err
 }
 
 func isDriveLetter(b byte) bool {
@@ -117,6 +108,8 @@ func openPackage(path string) (*os.File, error) {
 			suffix = "_race"
 		} else if base.Flag.MSan {
 			suffix = "_msan"
+		} else if base.Flag.ASan {
+			suffix = "_asan"
 		}
 
 		if file, err := os.Open(fmt.Sprintf("%s/pkg/%s_%s%s/%s.a", buildcfg.GOROOT, buildcfg.GOOS, buildcfg.GOARCH, suffix, path)); err == nil {
@@ -129,10 +122,6 @@ func openPackage(path string) (*os.File, error) {
 	return nil, errors.New("file not found")
 }
 
-// myheight tracks the local package's height based on packages
-// imported so far.
-var myheight int
-
 // resolveImportPath resolves an import path as it appears in a Go
 // source file to the package's full path.
 func resolveImportPath(path string) (string, error) {
@@ -144,7 +133,10 @@ func resolveImportPath(path string) (string, error) {
 		return "", errors.New("cannot import \"main\"")
 	}
 
-	if base.Ctxt.Pkgpath != "" && path == base.Ctxt.Pkgpath {
+	if base.Ctxt.Pkgpath == "" {
+		panic("missing pkgpath")
+	}
+	if path == base.Ctxt.Pkgpath {
 		return "", fmt.Errorf("import %q while compiling that package (import cycle)", path)
 	}
 
@@ -175,170 +167,133 @@ func resolveImportPath(path string) (string, error) {
 	return path, nil
 }
 
-// TODO(mdempsky): Return an error instead.
-func importfile(decl *syntax.ImportDecl) *types.Pkg {
-	if decl.Path.Kind != syntax.StringLit {
-		base.Errorf("import path must be a string")
-		return nil
-	}
-
-	path, err := strconv.Unquote(decl.Path.Value)
-	if err != nil {
-		base.Errorf("import path must be a string")
-		return nil
-	}
-
-	if err := checkImportPath(path, false); err != nil {
-		base.Errorf("%s", err.Error())
-		return nil
-	}
-
+// readImportFile reads the import file for the given package path and
+// returns its types.Pkg representation. If packages is non-nil, the
+// types2.Package representation is also returned.
+func readImportFile(path string, target *ir.Package, env *types2.Context, packages map[string]*types2.Package) (pkg1 *types.Pkg, pkg2 *types2.Package, err error) {
 	path, err = resolveImportPath(path)
 	if err != nil {
-		base.Errorf("%s", err)
-		return nil
+		return
 	}
-
-	importpkg := types.NewPkg(path, "")
-	if importpkg.Direct {
-		return importpkg // already fully loaded
-	}
-	importpkg.Direct = true
-	typecheck.Target.Imports = append(typecheck.Target.Imports, importpkg)
 
 	if path == "unsafe" {
-		return importpkg // initialized with universe
+		pkg1, pkg2 = types.UnsafePkg, types2.Unsafe
+
+		// TODO(mdempsky): Investigate if this actually matters. Why would
+		// the linker or runtime care whether a package imported unsafe?
+		if !pkg1.Direct {
+			pkg1.Direct = true
+			target.Imports = append(target.Imports, pkg1)
+		}
+
+		return
 	}
+
+	pkg1 = types.NewPkg(path, "")
+	if packages != nil {
+		pkg2 = packages[path]
+		assert(pkg1.Direct == (pkg2 != nil && pkg2.Complete()))
+	}
+
+	if pkg1.Direct {
+		return
+	}
+	pkg1.Direct = true
+	target.Imports = append(target.Imports, pkg1)
 
 	f, err := openPackage(path)
 	if err != nil {
-		base.Errorf("could not import %q: %v", path, err)
-		base.ErrorExit()
+		return
 	}
-	imp := bio.NewReader(f)
-	defer imp.Close()
-	file := f.Name()
+	defer f.Close()
 
-	// check object header
-	p, err := imp.ReadString('\n')
+	data, err := readExportData(f)
 	if err != nil {
-		base.Errorf("import %s: reading input: %v", file, err)
-		base.ErrorExit()
+		return
 	}
 
-	if p == "!<arch>\n" { // package archive
-		// package export block should be first
-		sz := archive.ReadHeader(imp.Reader, "__.PKGDEF")
-		if sz <= 0 {
-			base.Errorf("import %s: not a package file", file)
-			base.ErrorExit()
-		}
-		p, err = imp.ReadString('\n')
-		if err != nil {
-			base.Errorf("import %s: reading input: %v", file, err)
-			base.ErrorExit()
-		}
+	if base.Debug.Export != 0 {
+		fmt.Printf("importing %s (%s)\n", path, f.Name())
 	}
 
-	if !strings.HasPrefix(p, "go object ") {
-		base.Errorf("import %s: not a go object file: %s", file, p)
-		base.ErrorExit()
-	}
-	q := objabi.HeaderString()
-	if p != q {
-		base.Errorf("import %s: object is [%s] expected [%s]", file, p, q)
-		base.ErrorExit()
-	}
+	pr := pkgbits.NewPkgDecoder(pkg1.Path, data)
 
-	// process header lines
-	for {
-		p, err = imp.ReadString('\n')
-		if err != nil {
-			base.Errorf("import %s: reading input: %v", file, err)
-			base.ErrorExit()
-		}
-		if p == "\n" {
-			break // header ends with blank line
-		}
-	}
+	// Read package descriptors for both types2 and compiler backend.
+	readPackage(newPkgReader(pr), pkg1, false)
+	pkg2 = importer.ReadPackage(env, packages, pr)
 
-	// Expect $$B\n to signal binary import format.
-
-	// look for $$
-	var c byte
-	for {
-		c, err = imp.ReadByte()
-		if err != nil {
-			break
-		}
-		if c == '$' {
-			c, err = imp.ReadByte()
-			if c == '$' || err != nil {
-				break
-			}
-		}
-	}
-
-	// get character after $$
-	if err == nil {
-		c, _ = imp.ReadByte()
-	}
-
-	var fingerprint goobj.FingerprintType
-	switch c {
-	case '\n':
-		base.Errorf("cannot import %s: old export format no longer supported (recompile library)", path)
-		return nil
-
-	case 'B':
-		if base.Debug.Export != 0 {
-			fmt.Printf("importing %s (%s)\n", path, file)
-		}
-		imp.ReadByte() // skip \n after $$B
-
-		c, err = imp.ReadByte()
-		if err != nil {
-			base.Errorf("import %s: reading input: %v", file, err)
-			base.ErrorExit()
-		}
-
-		// Indexed format is distinguished by an 'i' byte,
-		// whereas previous export formats started with 'c', 'd', or 'v'.
-		if c != 'i' {
-			base.Errorf("import %s: unexpected package format byte: %v", file, c)
-			base.ErrorExit()
-		}
-		fingerprint = typecheck.ReadImports(importpkg, imp)
-
-	default:
-		base.Errorf("no import in %q", path)
-		base.ErrorExit()
-	}
-
-	// assume files move (get installed) so don't record the full path
-	if base.Flag.Cfg.PackageFile != nil {
-		// If using a packageFile map, assume path_ can be recorded directly.
-		base.Ctxt.AddImport(path, fingerprint)
-	} else {
-		// For file "/Users/foo/go/pkg/darwin_amd64/math.a" record "math.a".
-		base.Ctxt.AddImport(file[len(file)-len(path)-len(".a"):], fingerprint)
-	}
-
-	if importpkg.Height >= myheight {
-		myheight = importpkg.Height + 1
-	}
-
-	return importpkg
+	err = addFingerprint(path, data)
+	return
 }
 
-// The linker uses the magic symbol prefixes "go." and "type."
-// Avoid potential confusion between import paths and symbols
-// by rejecting these reserved imports for now. Also, people
-// "can do weird things in GOPATH and we'd prefer they didn't
-// do _that_ weird thing" (per rsc). See also #4257.
-var reservedimports = []string{
-	"go",
-	"type",
+// readExportData returns the contents of GC-created unified export data.
+func readExportData(f *os.File) (data string, err error) {
+	r := bio.NewReader(f)
+
+	sz, err := exportdata.FindPackageDefinition(r.Reader)
+	if err != nil {
+		return
+	}
+	end := r.Offset() + int64(sz)
+
+	abihdr, _, err := exportdata.ReadObjectHeaders(r.Reader)
+	if err != nil {
+		return
+	}
+
+	if expect := objabi.HeaderString(); abihdr != expect {
+		err = fmt.Errorf("object is [%s] expected [%s]", abihdr, expect)
+		return
+	}
+
+	_, err = exportdata.ReadExportDataHeader(r.Reader)
+	if err != nil {
+		return
+	}
+
+	pos := r.Offset()
+
+	// Map export data section (+ end-of-section marker) into memory
+	// as a single large string. This reduces heap fragmentation and
+	// allows returning individual substrings very efficiently.
+	var mapped string
+	mapped, err = base.MapFile(r.File(), pos, end-pos)
+	if err != nil {
+		return
+	}
+
+	// check for end-of-section marker "\n$$\n" and remove it
+	const marker = "\n$$\n"
+
+	var ok bool
+	data, ok = strings.CutSuffix(mapped, marker)
+	if !ok {
+		cutoff := data // include last 10 bytes in error message
+		if len(cutoff) >= 10 {
+			cutoff = cutoff[len(cutoff)-10:]
+		}
+		err = fmt.Errorf("expected $$ marker, but found %q (recompile package)", cutoff)
+		return
+	}
+
+	return
+}
+
+// addFingerprint reads the linker fingerprint included at the end of
+// the exportdata.
+func addFingerprint(path string, data string) error {
+	var fingerprint goobj.FingerprintType
+
+	pos := len(data) - len(fingerprint)
+	if pos < 0 {
+		return fmt.Errorf("missing linker fingerprint in exportdata, but found %q", data)
+	}
+	buf := []byte(data[pos:])
+
+	copy(fingerprint[:], buf)
+	base.Ctxt.AddImport(path, fingerprint)
+
+	return nil
 }
 
 func checkImportPath(path string, allowSpace bool) error {
@@ -350,7 +305,7 @@ func checkImportPath(path string, allowSpace bool) error {
 		return errors.New("import path contains NUL")
 	}
 
-	for _, ri := range reservedimports {
+	for ri := range base.ReservedImports {
 		if path == ri {
 			return fmt.Errorf("import path %q is reserved and cannot be used", path)
 		}
@@ -372,136 +327,4 @@ func checkImportPath(path string, allowSpace bool) error {
 	}
 
 	return nil
-}
-
-func pkgnotused(lineno src.XPos, path string, name string) {
-	// If the package was imported with a name other than the final
-	// import path element, show it explicitly in the error message.
-	// Note that this handles both renamed imports and imports of
-	// packages containing unconventional package declarations.
-	// Note that this uses / always, even on Windows, because Go import
-	// paths always use forward slashes.
-	elem := path
-	if i := strings.LastIndex(elem, "/"); i >= 0 {
-		elem = elem[i+1:]
-	}
-	if name == "" || elem == name {
-		base.ErrorfAt(lineno, "imported and not used: %q", path)
-	} else {
-		base.ErrorfAt(lineno, "imported and not used: %q as %s", path, name)
-	}
-}
-
-func mkpackage(pkgname string) {
-	if types.LocalPkg.Name == "" {
-		if pkgname == "_" {
-			base.Errorf("invalid package name _")
-		}
-		types.LocalPkg.Name = pkgname
-	} else {
-		if pkgname != types.LocalPkg.Name {
-			base.Errorf("package %s; expected %s", pkgname, types.LocalPkg.Name)
-		}
-	}
-}
-
-func clearImports() {
-	type importedPkg struct {
-		pos  src.XPos
-		path string
-		name string
-	}
-	var unused []importedPkg
-
-	for _, s := range types.LocalPkg.Syms {
-		n := ir.AsNode(s.Def)
-		if n == nil {
-			continue
-		}
-		if n.Op() == ir.OPACK {
-			// throw away top-level package name left over
-			// from previous file.
-			// leave s->block set to cause redeclaration
-			// errors if a conflicting top-level name is
-			// introduced by a different file.
-			p := n.(*ir.PkgName)
-			if !p.Used && base.SyntaxErrors() == 0 {
-				unused = append(unused, importedPkg{p.Pos(), p.Pkg.Path, s.Name})
-			}
-			s.Def = nil
-			continue
-		}
-		if types.IsDotAlias(s) {
-			// throw away top-level name left over
-			// from previous import . "x"
-			// We'll report errors after type checking in CheckDotImports.
-			s.Def = nil
-			continue
-		}
-	}
-
-	sort.Slice(unused, func(i, j int) bool { return unused[i].pos.Before(unused[j].pos) })
-	for _, pkg := range unused {
-		pkgnotused(pkg.pos, pkg.path, pkg.name)
-	}
-}
-
-// CheckDotImports reports errors for any unused dot imports.
-func CheckDotImports() {
-	for _, pack := range dotImports {
-		if !pack.Used {
-			base.ErrorfAt(pack.Pos(), "imported and not used: %q", pack.Pkg.Path)
-		}
-	}
-
-	// No longer needed; release memory.
-	dotImports = nil
-	typecheck.DotImportRefs = nil
-}
-
-// dotImports tracks all PkgNames that have been dot-imported.
-var dotImports []*ir.PkgName
-
-// find all the exported symbols in package referenced by PkgName,
-// and make them available in the current package
-func importDot(pack *ir.PkgName) {
-	if typecheck.DotImportRefs == nil {
-		typecheck.DotImportRefs = make(map[*ir.Ident]*ir.PkgName)
-	}
-
-	opkg := pack.Pkg
-	for _, s := range opkg.Syms {
-		if s.Def == nil {
-			if _, ok := typecheck.DeclImporter[s]; !ok {
-				continue
-			}
-		}
-		if !types.IsExported(s.Name) || strings.ContainsRune(s.Name, 0xb7) { // 0xb7 = center dot
-			continue
-		}
-		s1 := typecheck.Lookup(s.Name)
-		if s1.Def != nil {
-			pkgerror := fmt.Sprintf("during import %q", opkg.Path)
-			typecheck.Redeclared(base.Pos, s1, pkgerror)
-			continue
-		}
-
-		id := ir.NewIdent(src.NoXPos, s)
-		typecheck.DotImportRefs[id] = pack
-		s1.Def = id
-		s1.Block = 1
-	}
-
-	dotImports = append(dotImports, pack)
-}
-
-// importName is like oldname,
-// but it reports an error if sym is from another package and not exported.
-func importName(sym *types.Sym) ir.Node {
-	n := oldname(sym)
-	if !types.IsExported(sym.Name) && sym.Pkg != types.LocalPkg {
-		n.SetDiag(true)
-		base.Errorf("cannot refer to unexported name %s.%s", sym.Pkg.Name, sym.Name)
-	}
-	return n
 }

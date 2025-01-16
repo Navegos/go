@@ -30,6 +30,10 @@ type config struct {
 	Normalize           bool    `json:"normalize,omitempty"`
 	Sort                string  `json:"sort,omitempty"`
 
+	// Label pseudo stack frame generation options
+	TagRoot string `json:"tagroot,omitempty"`
+	TagLeaf string `json:"tagleaf,omitempty"`
+
 	// Filtering options
 	DropNegative bool    `json:"drop_negative,omitempty"`
 	NodeCount    int     `json:"nodecount,omitempty"`
@@ -47,6 +51,7 @@ type config struct {
 	TagShow      string  `json:"tagshow,omitempty"`
 	TagHide      string  `json:"taghide,omitempty"`
 	NoInlines    bool    `json:"noinlines,omitempty"`
+	ShowColumns  bool    `json:"showcolumns,omitempty"`
 
 	// Output granularity
 	Granularity string `json:"granularity,omitempty"`
@@ -63,7 +68,7 @@ func defaultConfig() config {
 		Trim:         true,
 		DivideBy:     1.0,
 		Sort:         "flat",
-		Granularity:  "functions",
+		Granularity:  "", // Default depends on the display format
 	}
 }
 
@@ -153,6 +158,7 @@ func init() {
 		"sort":                 "sort",
 		"granularity":          "g",
 		"noinlines":            "noinlines",
+		"showcolumns":          "showcolumns",
 	}
 
 	def := defaultConfig()

@@ -29,7 +29,7 @@ TEXT main(SB),NOSPLIT,$-8
 // c-archive) or when the shared library is loaded (for c-shared).
 // We expect argc and argv to be passed in the usual C ABI registers
 // DI and SI.
-TEXT _rt0_amd64_lib(SB),NOSPLIT,$0
+TEXT _rt0_amd64_lib(SB),NOSPLIT|NOFRAME,$0
 	// Transition from C ABI to Go ABI.
 	PUSH_REGS_HOST_TO_ABI0()
 
@@ -78,19 +78,97 @@ GLOBL _rt0_amd64_lib_argc<>(SB),NOPTR, $8
 DATA _rt0_amd64_lib_argv<>(SB)/8, $0
 GLOBL _rt0_amd64_lib_argv<>(SB),NOPTR, $8
 
-TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
+#ifdef GOAMD64_v2
+DATA bad_cpu_msg<>+0x00(SB)/84, $"This program can only be run on AMD64 processors with v2 microarchitecture support.\n"
+#endif
+
+#ifdef GOAMD64_v3
+DATA bad_cpu_msg<>+0x00(SB)/84, $"This program can only be run on AMD64 processors with v3 microarchitecture support.\n"
+#endif
+
+#ifdef GOAMD64_v4
+DATA bad_cpu_msg<>+0x00(SB)/84, $"This program can only be run on AMD64 processors with v4 microarchitecture support.\n"
+#endif
+
+GLOBL bad_cpu_msg<>(SB), RODATA, $84
+
+// Define a list of AMD64 microarchitecture level features
+// https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels
+
+                     // SSE3     SSSE3    CMPXCHNG16 SSE4.1    SSE4.2    POPCNT
+#define V2_FEATURES_CX (1 << 0 | 1 << 9 | 1 << 13  | 1 << 19 | 1 << 20 | 1 << 23)
+                         // LAHF/SAHF
+#define V2_EXT_FEATURES_CX (1 << 0)
+                                      // FMA       MOVBE     OSXSAVE   AVX       F16C
+#define V3_FEATURES_CX (V2_FEATURES_CX | 1 << 12 | 1 << 22 | 1 << 27 | 1 << 28 | 1 << 29)
+                                              // ABM (FOR LZNCT)
+#define V3_EXT_FEATURES_CX (V2_EXT_FEATURES_CX | 1 << 5)
+                         // BMI1     AVX2     BMI2
+#define V3_EXT_FEATURES_BX (1 << 3 | 1 << 5 | 1 << 8)
+                       // XMM      YMM
+#define V3_OS_SUPPORT_AX (1 << 1 | 1 << 2)
+
+#define V4_FEATURES_CX V3_FEATURES_CX
+
+#define V4_EXT_FEATURES_CX V3_EXT_FEATURES_CX
+                                              // AVX512F   AVX512DQ  AVX512CD  AVX512BW  AVX512VL
+#define V4_EXT_FEATURES_BX (V3_EXT_FEATURES_BX | 1 << 16 | 1 << 17 | 1 << 28 | 1 << 30 | 1 << 31)
+                                          // OPMASK   ZMM
+#define V4_OS_SUPPORT_AX (V3_OS_SUPPORT_AX | 1 << 5 | (1 << 6 | 1 << 7))
+
+#ifdef GOAMD64_v2
+#define NEED_MAX_CPUID 0x80000001
+#define NEED_FEATURES_CX V2_FEATURES_CX
+#define NEED_EXT_FEATURES_CX V2_EXT_FEATURES_CX
+#endif
+
+#ifdef GOAMD64_v3
+#define NEED_MAX_CPUID 0x80000001
+#define NEED_FEATURES_CX V3_FEATURES_CX
+#define NEED_EXT_FEATURES_CX V3_EXT_FEATURES_CX
+#define NEED_EXT_FEATURES_BX V3_EXT_FEATURES_BX
+#define NEED_OS_SUPPORT_AX V3_OS_SUPPORT_AX
+#endif
+
+#ifdef GOAMD64_v4
+#define NEED_MAX_CPUID 0x80000001
+#define NEED_FEATURES_CX V4_FEATURES_CX
+#define NEED_EXT_FEATURES_CX V4_EXT_FEATURES_CX
+#define NEED_EXT_FEATURES_BX V4_EXT_FEATURES_BX
+
+// Darwin requires a different approach to check AVX512 support, see CL 285572.
+#ifdef GOOS_darwin
+#define NEED_OS_SUPPORT_AX V3_OS_SUPPORT_AX
+// These values are from:
+// https://github.com/apple/darwin-xnu/blob/xnu-4570.1.46/osfmk/i386/cpu_capabilities.h
+#define commpage64_base_address         0x00007fffffe00000
+#define commpage64_cpu_capabilities64   (commpage64_base_address+0x010)
+#define commpage64_version              (commpage64_base_address+0x01E)
+#define AVX512F                         0x0000004000000000
+#define AVX512CD                        0x0000008000000000
+#define AVX512DQ                        0x0000010000000000
+#define AVX512BW                        0x0000020000000000
+#define AVX512VL                        0x0000100000000000
+#define NEED_DARWIN_SUPPORT             (AVX512F | AVX512DQ | AVX512CD | AVX512BW | AVX512VL)
+#else
+#define NEED_OS_SUPPORT_AX V4_OS_SUPPORT_AX
+#endif
+
+#endif
+
+TEXT runtime·rt0_go(SB),NOSPLIT|NOFRAME|TOPFRAME,$0
 	// copy arguments forward on an even stack
 	MOVQ	DI, AX		// argc
 	MOVQ	SI, BX		// argv
-	SUBQ	$(4*8+7), SP		// 2args 2auto
+	SUBQ	$(5*8), SP		// 3args 2auto
 	ANDQ	$~15, SP
-	MOVQ	AX, 16(SP)
-	MOVQ	BX, 24(SP)
+	MOVQ	AX, 24(SP)
+	MOVQ	BX, 32(SP)
 
 	// create istack out of the given (operating system) stack.
 	// _cgo_init may update stackguard.
 	MOVQ	$runtime·g0(SB), DI
-	LEAQ	(-64*1024+104)(SP), BX
+	LEAQ	(-64*1024)(SP), BX
 	MOVQ	BX, g_stackguard0(DI)
 	MOVQ	BX, g_stackguard1(DI)
 	MOVQ	BX, (g_stack+stack_lo)(DI)
@@ -99,13 +177,9 @@ TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
 	// find out information about the processor we're on
 	MOVL	$0, AX
 	CPUID
-	MOVL	AX, SI
 	CMPL	AX, $0
 	JE	nocpuinfo
 
-	// Figure out how to serialize RDTSC.
-	// On Intel processors LFENCE is enough. AMD requires MFENCE.
-	// Don't know about the rest, so let's do MFENCE.
 	CMPL	BX, $0x756E6547  // "Genu"
 	JNE	notintel
 	CMPL	DX, $0x49656E69  // "ineI"
@@ -113,9 +187,8 @@ TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
 	CMPL	CX, $0x6C65746E  // "ntel"
 	JNE	notintel
 	MOVB	$1, runtime·isIntel(SB)
-	MOVB	$1, runtime·lfenceBeforeRdtsc(SB)
-notintel:
 
+notintel:
 	// Load EAX=1 cpuid flags
 	MOVL	$1, AX
 	CPUID
@@ -128,16 +201,16 @@ nocpuinfo:
 	JZ	needtls
 	// arg 1: g0, already in DI
 	MOVQ	$setg_gcc<>(SB), SI // arg 2: setg_gcc
+	MOVQ	$0, DX	// arg 3, 4: not used when using platform's TLS
+	MOVQ	$0, CX
 #ifdef GOOS_android
 	MOVQ	$runtime·tls_g(SB), DX 	// arg 3: &tls_g
 	// arg 4: TLS base, stored in slot 0 (Android's TLS_SLOT_SELF).
 	// Compensate for tls_g (+16).
 	MOVQ	-16(TLS), CX
-#else
-	MOVQ	$0, DX	// arg 3, 4: not used when using platform's TLS
-	MOVQ	$0, CX
 #endif
 #ifdef GOOS_windows
+	MOVQ	$runtime·tls_g(SB), DX 	// arg 3: &tls_g
 	// Adjust for the Win64 calling convention.
 	MOVQ	CX, R9 // arg 4
 	MOVQ	DX, R8 // arg 3
@@ -149,7 +222,7 @@ nocpuinfo:
 	// update stackguard after _cgo_init
 	MOVQ	$runtime·g0(SB), CX
 	MOVQ	(g_stack+stack_lo)(CX), AX
-	ADDQ	$const__StackGuard, AX
+	ADDQ	$const_stackGuard, AX
 	MOVQ	AX, g_stackguard0(CX)
 	MOVQ	AX, g_stackguard1(CX)
 
@@ -178,6 +251,10 @@ needtls:
 	JMP ok
 #endif
 
+#ifdef GOOS_windows
+	CALL	runtime·wintls(SB)
+#endif
+
 	LEAQ	runtime·m0+m_tls(SB), DI
 	CALL	runtime·settls(SB)
 
@@ -201,11 +278,71 @@ ok:
 	MOVQ	AX, g_m(CX)
 
 	CLD				// convention is D is always left cleared
+
+	// Check GOAMD64 requirements
+	// We need to do this after setting up TLS, so that
+	// we can report an error if there is a failure. See issue 49586.
+#ifdef NEED_FEATURES_CX
+	MOVL	$0, AX
+	CPUID
+	CMPL	AX, $0
+	JE	bad_cpu
+	MOVL	$1, AX
+	CPUID
+	ANDL	$NEED_FEATURES_CX, CX
+	CMPL	CX, $NEED_FEATURES_CX
+	JNE	bad_cpu
+#endif
+
+#ifdef NEED_MAX_CPUID
+	MOVL	$0x80000000, AX
+	CPUID
+	CMPL	AX, $NEED_MAX_CPUID
+	JL	bad_cpu
+#endif
+
+#ifdef NEED_EXT_FEATURES_BX
+	MOVL	$7, AX
+	MOVL	$0, CX
+	CPUID
+	ANDL	$NEED_EXT_FEATURES_BX, BX
+	CMPL	BX, $NEED_EXT_FEATURES_BX
+	JNE	bad_cpu
+#endif
+
+#ifdef NEED_EXT_FEATURES_CX
+	MOVL	$0x80000001, AX
+	CPUID
+	ANDL	$NEED_EXT_FEATURES_CX, CX
+	CMPL	CX, $NEED_EXT_FEATURES_CX
+	JNE	bad_cpu
+#endif
+
+#ifdef NEED_OS_SUPPORT_AX
+	XORL    CX, CX
+	XGETBV
+	ANDL	$NEED_OS_SUPPORT_AX, AX
+	CMPL	AX, $NEED_OS_SUPPORT_AX
+	JNE	bad_cpu
+#endif
+
+#ifdef NEED_DARWIN_SUPPORT
+	MOVQ	$commpage64_version, BX
+	CMPW	(BX), $13  // cpu_capabilities64 undefined in versions < 13
+	JL	bad_cpu
+	MOVQ	$commpage64_cpu_capabilities64, BX
+	MOVQ	(BX), BX
+	MOVQ	$NEED_DARWIN_SUPPORT, CX
+	ANDQ	CX, BX
+	CMPQ	BX, CX
+	JNE	bad_cpu
+#endif
+
 	CALL	runtime·check(SB)
 
-	MOVL	16(SP), AX		// copy argc
+	MOVL	24(SP), AX		// copy argc
 	MOVL	AX, 0(SP)
-	MOVQ	24(SP), AX		// copy argv
+	MOVQ	32(SP), AX		// copy argv
 	MOVQ	AX, 8(SP)
 	CALL	runtime·args(SB)
 	CALL	runtime·osinit(SB)
@@ -214,9 +351,7 @@ ok:
 	// create a new goroutine to start program
 	MOVQ	$runtime·mainPC(SB), AX		// entry
 	PUSHQ	AX
-	PUSHQ	$0			// arg size
 	CALL	runtime·newproc(SB)
-	POPQ	AX
 	POPQ	AX
 
 	// start this M
@@ -225,8 +360,20 @@ ok:
 	CALL	runtime·abort(SB)	// mstart should never return
 	RET
 
-	// Prevent dead-code elimination of debugCallV2, which is
+bad_cpu: // show that the program requires a certain microarchitecture level.
+	MOVQ	$2, 0(SP)
+	MOVQ	$bad_cpu_msg<>(SB), AX
+	MOVQ	AX, 8(SP)
+	MOVQ	$84, 16(SP)
+	CALL	runtime·write(SB)
+	MOVQ	$1, 0(SP)
+	CALL	runtime·exit(SB)
+	CALL	runtime·abort(SB)
+	RET
+
+	// Prevent dead-code elimination of debugCallV2 and debugPinnerV1, which are
 	// intended to be called by debuggers.
+	MOVQ	$runtime·debugPinnerV1<ABIInternal>(SB), AX
 	MOVQ	$runtime·debugCallV2<ABIInternal>(SB), AX
 	RET
 
@@ -244,7 +391,7 @@ TEXT runtime·asminit(SB),NOSPLIT,$0-0
 	// No per-thread init.
 	RET
 
-TEXT runtime·mstart(SB),NOSPLIT|TOPFRAME,$0
+TEXT runtime·mstart(SB),NOSPLIT|TOPFRAME|NOFRAME,$0
 	CALL	runtime·mstart0(SB)
 	RET // not reached
 
@@ -279,16 +426,21 @@ TEXT gogo<>(SB), NOSPLIT, $0
 // Switch to m->g0's stack, call fn(g).
 // Fn must never return. It should gogo(&g->sched)
 // to keep running g.
-#ifdef GOEXPERIMENT_regabiargs
 TEXT runtime·mcall<ABIInternal>(SB), NOSPLIT, $0-8
 	MOVQ	AX, DX	// DX = fn
 
-	// save state in g->sched
-	MOVQ	0(SP), BX	// caller's PC
+	// Save state in g->sched. The caller's SP and PC are restored by gogo to
+	// resume execution in the caller's frame (implicit return). The caller's BP
+	// is also restored to support frame pointer unwinding.
+	MOVQ	SP, BX	// hide (SP) reads from vet
+	MOVQ	8(BX), BX	// caller's PC
 	MOVQ	BX, (g_sched+gobuf_pc)(R14)
 	LEAQ	fn+0(FP), BX	// caller's SP
 	MOVQ	BX, (g_sched+gobuf_sp)(R14)
-	MOVQ	BP, (g_sched+gobuf_bp)(R14)
+	// Get the caller's frame pointer by dereferencing BP. Storing BP as it is
+	// can cause a frame pointer cycle, see CL 476235.
+	MOVQ	(BP), BX // caller's BP
+	MOVQ	BX, (g_sched+gobuf_bp)(R14)
 
 	// switch to m->g0 & its stack, call fn
 	MOVQ	g_m(R14), BX
@@ -305,48 +457,26 @@ goodm:
 	PUSHQ	AX	// open up space for fn's arg spill slot
 	MOVQ	0(DX), R12
 	CALL	R12		// fn(g)
+	// The Windows native stack unwinder incorrectly classifies the next instruction
+	// as part of the function epilogue, producing a wrong call stack.
+	// Add a NOP to work around this issue. See go.dev/issue/67007.
+	BYTE	$0x90
 	POPQ	AX
 	JMP	runtime·badmcall2(SB)
 	RET
-#else
-TEXT runtime·mcall(SB), NOSPLIT, $0-8
-	MOVQ	fn+0(FP), DI
-
-	get_tls(CX)
-	MOVQ	g(CX), AX	// save state in g->sched
-	MOVQ	0(SP), BX	// caller's PC
-	MOVQ	BX, (g_sched+gobuf_pc)(AX)
-	LEAQ	fn+0(FP), BX	// caller's SP
-	MOVQ	BX, (g_sched+gobuf_sp)(AX)
-	MOVQ	BP, (g_sched+gobuf_bp)(AX)
-
-	// switch to m->g0 & its stack, call fn
-	MOVQ	g(CX), BX
-	MOVQ	g_m(BX), BX
-	MOVQ	m_g0(BX), SI
-	CMPQ	SI, AX	// if g == m->g0 call badmcall
-	JNE	3(PC)
-	MOVQ	$runtime·badmcall(SB), AX
-	JMP	AX
-	MOVQ	SI, g(CX)	// g = m->g0
-	MOVQ	SI, R14	// set the g register
-	MOVQ	(g_sched+gobuf_sp)(SI), SP	// sp = m->g0->sched.sp
-	PUSHQ	AX
-	MOVQ	DI, DX
-	MOVQ	0(DI), DI
-	CALL	DI
-	POPQ	AX
-	MOVQ	$runtime·badmcall2(SB), AX
-	JMP	AX
-	RET
-#endif
 
 // systemstack_switch is a dummy routine that systemstack leaves at the bottom
 // of the G stack. We need to distinguish the routine that
 // lives at the bottom of the G stack from the one that lives
 // at the top of the system stack because the one at the top of
 // the system stack terminates the stack walk (see topofstack()).
+// The frame layout needs to match systemstack
+// so that it can pretend to be systemstack_switch.
 TEXT runtime·systemstack_switch(SB), NOSPLIT, $0-0
+	UNDEF
+	// Make sure this function is not leaf,
+	// so the frame is saved.
+	CALL	runtime·abort(SB)
 	RET
 
 // func systemstack(fn func())
@@ -366,16 +496,17 @@ TEXT runtime·systemstack(SB), NOSPLIT, $0-8
 	CMPQ	AX, m_curg(BX)
 	JNE	bad
 
-	// switch stacks
-	// save our state in g->sched. Pretend to
+	// Switch stacks.
+	// The original frame pointer is stored in BP,
+	// which is useful for stack unwinding.
+	// Save our state in g->sched. Pretend to
 	// be systemstack_switch if the G stack is scanned.
 	CALL	gosave_systemstack_switch<>(SB)
 
 	// switch to g0
 	MOVQ	DX, g(CX)
 	MOVQ	DX, R14 // set the g register
-	MOVQ	(g_sched+gobuf_sp)(DX), BX
-	MOVQ	BX, SP
+	MOVQ	(g_sched+gobuf_sp)(DX), SP
 
 	// call target function
 	MOVQ	DI, DX
@@ -389,7 +520,9 @@ TEXT runtime·systemstack(SB), NOSPLIT, $0-8
 	MOVQ	m_curg(BX), AX
 	MOVQ	AX, g(CX)
 	MOVQ	(g_sched+gobuf_sp)(AX), SP
+	MOVQ	(g_sched+gobuf_bp)(AX), BP
 	MOVQ	$0, (g_sched+gobuf_sp)(AX)
+	MOVQ	$0, (g_sched+gobuf_bp)(AX)
 	RET
 
 noswitch:
@@ -398,6 +531,9 @@ noswitch:
 	// at an intermediate systemstack.
 	MOVQ	DI, DX
 	MOVQ	0(DI), DI
+	// The function epilogue is not called on a tail call.
+	// Pop BP from the stack to simulate it.
+	POPQ	BP
 	JMP	DI
 
 bad:
@@ -406,6 +542,30 @@ bad:
 	CALL	AX
 	INT	$3
 
+// func switchToCrashStack0(fn func())
+TEXT runtime·switchToCrashStack0<ABIInternal>(SB), NOSPLIT, $0-8
+	MOVQ	g_m(R14), BX // curm
+
+	// set g to gcrash
+	LEAQ	runtime·gcrash(SB), R14 // g = &gcrash
+	MOVQ	BX, g_m(R14)            // g.m = curm
+	MOVQ	R14, m_g0(BX)           // curm.g0 = g
+	get_tls(CX)
+	MOVQ	R14, g(CX)
+
+	// switch to crashstack
+	MOVQ	(g_stack+stack_hi)(R14), BX
+	SUBQ	$(4*8), BX
+	MOVQ	BX, SP
+
+	// call target function
+	MOVQ	AX, DX
+	MOVQ	0(AX), AX
+	CALL	AX
+
+	// should never return
+	CALL	runtime·abort(SB)
+	UNDEF
 
 /*
  * support for morestack
@@ -417,20 +577,29 @@ bad:
 // the top of a stack (for example, morestack calling newstack
 // calling the scheduler calling newm calling gc), so we must
 // record an argument size. For that purpose, it has no arguments.
-TEXT runtime·morestack(SB),NOSPLIT,$0-0
+TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	// Cannot grow scheduler stack (m->g0).
 	get_tls(CX)
-	MOVQ	g(CX), BX
-	MOVQ	g_m(BX), BX
-	MOVQ	m_g0(BX), SI
-	CMPQ	g(CX), SI
+	MOVQ	g(CX), DI     // DI = g
+	MOVQ	g_m(DI), BX   // BX = m
+
+	// Set g->sched to context in f.
+	MOVQ	0(SP), AX // f's PC
+	MOVQ	AX, (g_sched+gobuf_pc)(DI)
+	LEAQ	8(SP), AX // f's SP
+	MOVQ	AX, (g_sched+gobuf_sp)(DI)
+	MOVQ	BP, (g_sched+gobuf_bp)(DI)
+	MOVQ	DX, (g_sched+gobuf_ctxt)(DI)
+
+	MOVQ	m_g0(BX), SI  // SI = m.g0
+	CMPQ	DI, SI
 	JNE	3(PC)
 	CALL	runtime·badmorestackg0(SB)
 	CALL	runtime·abort(SB)
 
 	// Cannot grow signal stack (m->gsignal).
 	MOVQ	m_gsignal(BX), SI
-	CMPQ	g(CX), SI
+	CMPQ	DI, SI
 	JNE	3(PC)
 	CALL	runtime·badmorestackgsignal(SB)
 	CALL	runtime·abort(SB)
@@ -442,22 +611,13 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVQ	AX, (m_morebuf+gobuf_pc)(BX)
 	LEAQ	16(SP), AX	// f's caller's SP
 	MOVQ	AX, (m_morebuf+gobuf_sp)(BX)
-	get_tls(CX)
-	MOVQ	g(CX), SI
-	MOVQ	SI, (m_morebuf+gobuf_g)(BX)
-
-	// Set g->sched to context in f.
-	MOVQ	0(SP), AX // f's PC
-	MOVQ	AX, (g_sched+gobuf_pc)(SI)
-	LEAQ	8(SP), AX // f's SP
-	MOVQ	AX, (g_sched+gobuf_sp)(SI)
-	MOVQ	BP, (g_sched+gobuf_bp)(SI)
-	MOVQ	DX, (g_sched+gobuf_ctxt)(SI)
+	MOVQ	DI, (m_morebuf+gobuf_g)(BX)
 
 	// Call newstack on m->g0's stack.
 	MOVQ	m_g0(BX), BX
 	MOVQ	BX, g(CX)
 	MOVQ	(g_sched+gobuf_sp)(BX), SP
+	MOVQ	(g_sched+gobuf_bp)(BX), BP
 	CALL	runtime·newstack(SB)
 	CALL	runtime·abort(SB)	// crash if newstack returns
 	RET
@@ -467,9 +627,8 @@ TEXT runtime·morestack_noctxt(SB),NOSPLIT,$0
 	MOVL	$0, DX
 	JMP	runtime·morestack(SB)
 
-#ifdef GOEXPERIMENT_regabireflect
 // spillArgs stores return values from registers to a *internal/abi.RegArgs in R12.
-TEXT ·spillArgs<ABIInternal>(SB),NOSPLIT,$0-0
+TEXT ·spillArgs(SB),NOSPLIT,$0-0
 	MOVQ AX, 0(R12)
 	MOVQ BX, 8(R12)
 	MOVQ CX, 16(R12)
@@ -497,7 +656,7 @@ TEXT ·spillArgs<ABIInternal>(SB),NOSPLIT,$0-0
 	RET
 
 // unspillArgs loads args into registers from a *internal/abi.RegArgs in R12.
-TEXT ·unspillArgs<ABIInternal>(SB),NOSPLIT,$0-0
+TEXT ·unspillArgs(SB),NOSPLIT,$0-0
 	MOVQ 0(R12), AX
 	MOVQ 8(R12), BX
 	MOVQ 16(R12), CX
@@ -523,15 +682,6 @@ TEXT ·unspillArgs<ABIInternal>(SB),NOSPLIT,$0-0
 	MOVQ 176(R12), X13
 	MOVQ 184(R12), X14
 	RET
-#else
-// spillArgs stores return values from registers to a pointer in R12.
-TEXT ·spillArgs<ABIInternal>(SB),NOSPLIT,$0-0
-	RET
-
-// unspillArgs loads args into registers from a pointer in R12.
-TEXT ·unspillArgs<ABIInternal>(SB),NOSPLIT,$0-0
-	RET
-#endif
 
 // reflectcall: call a function with the given argument list
 // func call(stackArgsType *_type, f *FuncVal, stackArgs *byte, stackArgsSize, stackRetOffset, frameSize uint32, regArgs *abi.RegArgs).
@@ -588,7 +738,7 @@ TEXT NAME(SB), WRAPPER, $MAXSIZE-48;		\
 	REP;MOVSB;				\
 	/* set up argument registers */		\
 	MOVQ    regArgs+40(FP), R12;		\
-	CALL    ·unspillArgs<ABIInternal>(SB);		\
+	CALL    ·unspillArgs(SB);		\
 	/* call function */			\
 	MOVQ	f+8(FP), DX;			\
 	PCDATA  $PCDATA_StackMapIndex, $0;	\
@@ -596,7 +746,7 @@ TEXT NAME(SB), WRAPPER, $MAXSIZE-48;		\
 	CALL	R12;				\
 	/* copy register return values back */		\
 	MOVQ    regArgs+40(FP), R12;		\
-	CALL    ·spillArgs<ABIInternal>(SB);		\
+	CALL    ·spillArgs(SB);		\
 	MOVLQZX	stackArgsSize+24(FP), CX;		\
 	MOVLQZX	stackRetOffset+28(FP), BX;		\
 	MOVQ	stackArgs+16(FP), DI;		\
@@ -659,37 +809,22 @@ again:
 	RET
 
 
-TEXT ·publicationBarrier(SB),NOSPLIT,$0-0
+TEXT ·publicationBarrier<ABIInternal>(SB),NOSPLIT,$0-0
 	// Stores are already ordered on x86, so this is just a
 	// compile barrier.
 	RET
 
-// func jmpdefer(fv *funcval, argp uintptr)
-// argp is a caller SP.
-// called from deferreturn.
-// 1. pop the caller
-// 2. sub 5 bytes from the callers return
-// 3. jmp to the argument
-TEXT runtime·jmpdefer(SB), NOSPLIT, $0-16
-	MOVQ	fv+0(FP), DX	// fn
-	MOVQ	argp+8(FP), BX	// caller sp
-	LEAQ	-8(BX), SP	// caller sp after CALL
-	MOVQ	-8(SP), BP	// restore BP as if deferreturn returned (harmless if framepointers not in use)
-	SUBQ	$5, (SP)	// return to CALL again
-	MOVQ	0(DX), BX
-	JMP	BX	// but first run the deferred function
-
 // Save state of caller into g->sched,
 // but using fake PC from systemstack_switch.
-// Must only be called from functions with no locals ($0)
-// or else unwinding from systemstack_switch is incorrect.
+// Must only be called from functions with frame pointer
+// and without locals ($0) or else unwinding from
+// systemstack_switch is incorrect.
 // Smashes R9.
-TEXT gosave_systemstack_switch<>(SB),NOSPLIT,$0
-#ifndef GOEXPERIMENT_regabig
-	get_tls(R14)
-	MOVQ	g(R14), R14
-#endif
-	MOVQ	$runtime·systemstack_switch(SB), R9
+TEXT gosave_systemstack_switch<>(SB),NOSPLIT|NOFRAME,$0
+	// Take systemstack_switch PC and add 8 bytes to skip
+	// the prologue. The final location does not matter
+	// as long as we are between the prologue and the epilogue.
+	MOVQ	$runtime·systemstack_switch+8(SB), R9
 	MOVQ	R9, (g_sched+gobuf_pc)(R14)
 	LEAQ	8(SP), R9
 	MOVQ	R9, (g_sched+gobuf_sp)(R14)
@@ -705,11 +840,10 @@ TEXT gosave_systemstack_switch<>(SB),NOSPLIT,$0
 // func asmcgocall_no_g(fn, arg unsafe.Pointer)
 // Call fn(arg) aligned appropriately for the gcc ABI.
 // Called on a system stack, and there may be no g yet (during needm).
-TEXT ·asmcgocall_no_g(SB),NOSPLIT,$0-16
+TEXT ·asmcgocall_no_g(SB),NOSPLIT,$32-16
 	MOVQ	fn+0(FP), AX
 	MOVQ	arg+8(FP), BX
 	MOVQ	SP, DX
-	SUBQ	$32, SP
 	ANDQ	$~15, SP	// alignment
 	MOVQ	DX, 8(SP)
 	MOVQ	BX, DI		// DI = first argument in AMD64 ABI
@@ -718,6 +852,33 @@ TEXT ·asmcgocall_no_g(SB),NOSPLIT,$0-16
 	MOVQ	8(SP), DX
 	MOVQ	DX, SP
 	RET
+
+// asmcgocall_landingpad calls AX with BX as argument.
+// Must be called on the system stack.
+TEXT ·asmcgocall_landingpad(SB),NOSPLIT,$0-0
+#ifdef GOOS_windows
+	// Make sure we have enough room for 4 stack-backed fast-call
+	// registers as per Windows amd64 calling convention.
+	ADJSP	$32
+	// On Windows, asmcgocall_landingpad acts as landing pad for exceptions
+	// thrown in the cgo call. Exceptions that reach this function will be
+	// handled by runtime.sehtramp thanks to the SEH metadata added
+	// by the compiler.
+	// Note that runtime.sehtramp can't be attached directly to asmcgocall
+	// because its initial stack pointer can be outside the system stack bounds,
+	// and Windows stops the stack unwinding without calling the exception handler
+	// when it reaches that point.
+	MOVQ	BX, CX		// CX = first argument in Win64
+	CALL	AX
+	// The exception handler is not called if the next instruction is part of
+	// the epilogue, which includes the RET instruction, so we need to add a NOP here.
+	BYTE	$0x90
+	ADJSP	$-32
+	RET
+#endif
+	// Tail call AX on non-Windows, as the extra stack frame is not needed.
+	MOVQ	BX, DI		// DI = first argument in AMD64 ABI
+	JMP	AX
 
 // func asmcgocall(fn, arg unsafe.Pointer) int32
 // Call fn(arg) on the scheduler stack,
@@ -731,44 +892,41 @@ TEXT ·asmcgocall(SB),NOSPLIT,$0-20
 
 	// Figure out if we need to switch to m->g0 stack.
 	// We get called to create new OS threads too, and those
-	// come in on the m->g0 stack already.
+	// come in on the m->g0 stack already. Or we might already
+	// be on the m->gsignal stack.
 	get_tls(CX)
-	MOVQ	g(CX), R8
-	CMPQ	R8, $0
-	JEQ	nosave
-	MOVQ	g_m(R8), R8
-	MOVQ	m_g0(R8), SI
 	MOVQ	g(CX), DI
-	CMPQ	SI, DI
+	CMPQ	DI, $0
 	JEQ	nosave
+	MOVQ	g_m(DI), R8
 	MOVQ	m_gsignal(R8), SI
-	CMPQ	SI, DI
+	CMPQ	DI, SI
+	JEQ	nosave
+	MOVQ	m_g0(R8), SI
+	CMPQ	DI, SI
 	JEQ	nosave
 
 	// Switch to system stack.
-	MOVQ	m_g0(R8), SI
+	// The original frame pointer is stored in BP,
+	// which is useful for stack unwinding.
 	CALL	gosave_systemstack_switch<>(SB)
 	MOVQ	SI, g(CX)
 	MOVQ	(g_sched+gobuf_sp)(SI), SP
 
 	// Now on a scheduling stack (a pthread-created stack).
-	// Make sure we have enough room for 4 stack-backed fast-call
-	// registers as per windows amd64 calling convention.
-	SUBQ	$64, SP
+	SUBQ	$16, SP
 	ANDQ	$~15, SP	// alignment for gcc ABI
-	MOVQ	DI, 48(SP)	// save g
+	MOVQ	DI, 8(SP)	// save g
 	MOVQ	(g_stack+stack_hi)(DI), DI
 	SUBQ	DX, DI
-	MOVQ	DI, 40(SP)	// save depth in stack (can't just save SP, as stack might be copied during a callback)
-	MOVQ	BX, DI		// DI = first argument in AMD64 ABI
-	MOVQ	BX, CX		// CX = first argument in Win64
-	CALL	AX
+	MOVQ	DI, 0(SP)	// save depth in stack (can't just save SP, as stack might be copied during a callback)
+	CALL	runtime·asmcgocall_landingpad(SB)
 
 	// Restore registers, g, stack pointer.
 	get_tls(CX)
-	MOVQ	48(SP), DI
+	MOVQ	8(SP), DI
 	MOVQ	(g_stack+stack_hi)(DI), SI
-	SUBQ	40(SP), SI
+	SUBQ	0(SP), SI
 	MOVQ	DI, g(CX)
 	MOVQ	SI, SP
 
@@ -786,14 +944,12 @@ nosave:
 	// but then the only path through this code would be a rare case on Solaris.
 	// Using this code for all "already on system stack" calls exercises it more,
 	// which should help keep it correct.
-	SUBQ	$64, SP
+	SUBQ	$16, SP
 	ANDQ	$~15, SP
-	MOVQ	$0, 48(SP)		// where above code stores g, in case someone looks during debugging
-	MOVQ	DX, 40(SP)	// save original stack pointer
-	MOVQ	BX, DI		// DI = first argument in AMD64 ABI
-	MOVQ	BX, CX		// CX = first argument in Win64
-	CALL	AX
-	MOVQ	40(SP), SI	// restore original stack pointer
+	MOVQ	$0, 8(SP)		// where above code stores g, in case someone looks during debugging
+	MOVQ	DX, 0(SP)	// save original stack pointer
+	CALL	runtime·asmcgocall_landingpad(SB)
+	MOVQ	0(SP), SI	// restore original stack pointer
 	MOVQ	SI, SP
 	MOVL	AX, ret+16(FP)
 	RET
@@ -811,7 +967,20 @@ GLOBL zeroTLS<>(SB),RODATA,$const_tlsSize
 TEXT ·cgocallback(SB),NOSPLIT,$24-24
 	NO_LOCAL_POINTERS
 
-	// If g is nil, Go did not create the current thread.
+	// Skip cgocallbackg, just dropm when fn is nil, and frame is the saved g.
+	// It is used to dropm while thread is exiting.
+	MOVQ	fn+0(FP), AX
+	CMPQ	AX, $0
+	JNE	loadg
+	// Restore the g from frame.
+	get_tls(CX)
+	MOVQ	frame+8(FP), BX
+	MOVQ	BX, g(CX)
+	JMP	dropm
+
+loadg:
+	// If g is nil, Go did not create the current thread,
+	// or if this thread never called into Go on pthread platforms.
 	// Call needm to obtain one m for temporary use.
 	// In this case, we're running on the thread stack, so there's
 	// lots of space, but the linker doesn't know. Hide the call from
@@ -849,9 +1018,9 @@ needm:
 	// a bad value in there, in case needm tries to use it.
 	XORPS	X15, X15
 	XORQ    R14, R14
-	MOVQ	$runtime·needm<ABIInternal>(SB), AX
+	MOVQ	$runtime·needAndBindM<ABIInternal>(SB), AX
 	CALL	AX
-	MOVQ	$0, savedm-8(SP) // dropm on return
+	MOVQ	$0, savedm-8(SP)
 	get_tls(CX)
 	MOVQ	g(CX), BX
 	MOVQ	g_m(BX), BX
@@ -940,11 +1109,26 @@ havem:
 	MOVQ	0(SP), AX
 	MOVQ	AX, (g_sched+gobuf_sp)(SI)
 
-	// If the m on entry was nil, we called needm above to borrow an m
-	// for the duration of the call. Since the call is over, return it with dropm.
+	// If the m on entry was nil, we called needm above to borrow an m,
+	// 1. for the duration of the call on non-pthread platforms,
+	// 2. or the duration of the C thread alive on pthread platforms.
+	// If the m on entry wasn't nil,
+	// 1. the thread might be a Go thread,
+	// 2. or it wasn't the first call from a C thread on pthread platforms,
+	//    since then we skip dropm to reuse the m in the first call.
 	MOVQ	savedm-8(SP), BX
 	CMPQ	BX, $0
 	JNE	done
+
+	// Skip dropm to reuse it in the next call, when a pthread key has been created.
+	MOVQ	_cgo_pthread_key_created(SB), AX
+	// It means cgo is disabled when _cgo_pthread_key_created is a nil pointer, need dropm.
+	CMPQ	AX, $0
+	JEQ	dropm
+	CMPQ	(AX), $0
+	JNE	done
+
+dropm:
 	MOVQ	$runtime·dropm(SB), AX
 	CALL	AX
 #ifdef GOOS_windows
@@ -980,7 +1164,7 @@ loop:
 	JMP	loop
 
 // check that SP is in range [g->stack.lo, g->stack.hi)
-TEXT runtime·stackcheck(SB), NOSPLIT, $0-0
+TEXT runtime·stackcheck(SB), NOSPLIT|NOFRAME, $0-0
 	get_tls(CX)
 	MOVQ	g(CX), AX
 	CMPQ	(g_stack+stack_hi)(AX), SP
@@ -993,77 +1177,62 @@ TEXT runtime·stackcheck(SB), NOSPLIT, $0-0
 
 // func cputicks() int64
 TEXT runtime·cputicks(SB),NOSPLIT,$0-0
-	CMPB	runtime·lfenceBeforeRdtsc(SB), $1
-	JNE	mfence
-	LFENCE
-	JMP	done
-mfence:
-	MFENCE
+	CMPB	internal∕cpu·X86+const_offsetX86HasRDTSCP(SB), $1
+	JNE	fences
+	// Instruction stream serializing RDTSCP is supported.
+	// RDTSCP is supported by Intel Nehalem (2008) and
+	// AMD K8 Rev. F (2006) and newer.
+	RDTSCP
 done:
-	RDTSC
 	SHLQ	$32, DX
 	ADDQ	DX, AX
 	MOVQ	AX, ret+0(FP)
 	RET
+fences:
+	// MFENCE is instruction stream serializing and flushes the
+	// store buffers on AMD. The serialization semantics of LFENCE on AMD
+	// are dependent on MSR C001_1029 and CPU generation.
+	// LFENCE on Intel does wait for all previous instructions to have executed.
+	// Intel recommends MFENCE;LFENCE in its manuals before RDTSC to have all
+	// previous instructions executed and all previous loads and stores to globally visible.
+	// Using MFENCE;LFENCE here aligns the serializing properties without
+	// runtime detection of CPU manufacturer.
+	MFENCE
+	LFENCE
+	RDTSC
+	JMP done
 
 // func memhash(p unsafe.Pointer, h, s uintptr) uintptr
 // hash function using AES hardware instructions
 TEXT runtime·memhash<ABIInternal>(SB),NOSPLIT,$0-32
-#ifdef GOEXPERIMENT_regabiargs
 	// AX = ptr to data
 	// BX = seed
 	// CX = size
-#endif
 	CMPB	runtime·useAeshash(SB), $0
 	JEQ	noaes
-#ifndef GOEXPERIMENT_regabiargs
-	MOVQ	p+0(FP), AX	// ptr to data
-	MOVQ	s+16(FP), CX	// size
-	LEAQ	ret+24(FP), DX
-#endif
 	JMP	aeshashbody<>(SB)
 noaes:
 	JMP	runtime·memhashFallback<ABIInternal>(SB)
 
 // func strhash(p unsafe.Pointer, h uintptr) uintptr
 TEXT runtime·strhash<ABIInternal>(SB),NOSPLIT,$0-24
-#ifdef GOEXPERIMENT_regabiargs
 	// AX = ptr to string struct
 	// BX = seed
-#endif
 	CMPB	runtime·useAeshash(SB), $0
 	JEQ	noaes
-#ifndef GOEXPERIMENT_regabiargs
-	MOVQ	p+0(FP), AX	// ptr to string struct
-#endif
 	MOVQ	8(AX), CX	// length of string
 	MOVQ	(AX), AX	// string data
-#ifndef GOEXPERIMENT_regabiargs
-	LEAQ	ret+16(FP), DX
-#endif
 	JMP	aeshashbody<>(SB)
 noaes:
 	JMP	runtime·strhashFallback<ABIInternal>(SB)
 
 // AX: data
-#ifdef GOEXPERIMENT_regabiargs
 // BX: hash seed
-#else
-// h+8(FP): hash seed
-#endif
 // CX: length
-#ifdef GOEXPERIMENT_regabiargs
 // At return: AX = return value
-#else
-// DX: address to put return value
-#endif
 TEXT aeshashbody<>(SB),NOSPLIT,$0-0
 	// Fill an SSE register with our seeds.
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	BX, X0				// 64 bits of per-table hash seed
-#else
-	MOVQ	h+8(FP), X0			// 64 bits of per-table hash seed
-#endif
 	PINSRW	$4, CX, X0			// 16 bits of length
 	PSHUFHW $0, X0, X0			// repeat length 4 times total
 	MOVO	X0, X1				// save unscrambled seed
@@ -1100,11 +1269,7 @@ final1:
 	AESENC	X1, X1	// scramble combo 3 times
 	AESENC	X1, X1
 	AESENC	X1, X1
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	X1, AX	// return X1
-#else
-	MOVQ	X1, (DX)
-#endif
 	RET
 
 endofpage:
@@ -1120,11 +1285,7 @@ endofpage:
 aes0:
 	// Return scrambled input seed
 	AESENC	X0, X0
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	X0, AX	// return X0
-#else
-	MOVQ	X0, (DX)
-#endif
 	RET
 
 aes16:
@@ -1154,11 +1315,7 @@ aes17to32:
 
 	// combine results
 	PXOR	X3, X2
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	X2, AX	// return X2
-#else
-	MOVQ	X2, (DX)
-#endif
 	RET
 
 aes33to64:
@@ -1200,11 +1357,7 @@ aes33to64:
 	PXOR	X6, X4
 	PXOR	X7, X5
 	PXOR	X5, X4
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	X4, AX	// return X4
-#else
-	MOVQ	X4, (DX)
-#endif
 	RET
 
 aes65to128:
@@ -1286,15 +1439,9 @@ aes65to128:
 	PXOR	X10, X8
 	PXOR	X11, X9
 	PXOR	X9, X8
-#ifdef GOEXPERIMENT_regabig
 	// X15 must be zero on return
 	PXOR	X15, X15
-#endif
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	X8, AX	// return X8
-#else
-	MOVQ	X8, (DX)
-#endif
 	RET
 
 aes129plus:
@@ -1344,6 +1491,7 @@ aes129plus:
 	DECQ	CX
 	SHRQ	$7, CX
 
+	PCALIGN $16
 aesloop:
 	// scramble state
 	AESENC	X8, X8
@@ -1410,41 +1558,24 @@ aesloop:
 	PXOR	X10, X8
 	PXOR	X11, X9
 	PXOR	X9, X8
-#ifdef GOEXPERIMENT_regabig
 	// X15 must be zero on return
 	PXOR	X15, X15
-#endif
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	X8, AX	// return X8
-#else
-	MOVQ	X8, (DX)
-#endif
 	RET
 
 // func memhash32(p unsafe.Pointer, h uintptr) uintptr
 // ABIInternal for performance.
 TEXT runtime·memhash32<ABIInternal>(SB),NOSPLIT,$0-24
-#ifdef GOEXPERIMENT_regabiargs
 	// AX = ptr to data
 	// BX = seed
-#endif
 	CMPB	runtime·useAeshash(SB), $0
 	JEQ	noaes
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	BX, X0	// X0 = seed
-#else
-	MOVQ	p+0(FP), AX	// ptr to data
-	MOVQ	h+8(FP), X0	// seed
-#endif
 	PINSRD	$2, (AX), X0	// data
 	AESENC	runtime·aeskeysched+0(SB), X0
 	AESENC	runtime·aeskeysched+16(SB), X0
 	AESENC	runtime·aeskeysched+32(SB), X0
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	X0, AX	// return X0
-#else
-	MOVQ	X0, ret+16(FP)
-#endif
 	RET
 noaes:
 	JMP	runtime·memhash32Fallback<ABIInternal>(SB)
@@ -1452,28 +1583,16 @@ noaes:
 // func memhash64(p unsafe.Pointer, h uintptr) uintptr
 // ABIInternal for performance.
 TEXT runtime·memhash64<ABIInternal>(SB),NOSPLIT,$0-24
-#ifdef GOEXPERIMENT_regabiargs
 	// AX = ptr to data
 	// BX = seed
-#else
-#endif
 	CMPB	runtime·useAeshash(SB), $0
 	JEQ	noaes
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	BX, X0	// X0 = seed
-#else
-	MOVQ	p+0(FP), AX	// ptr to data
-	MOVQ	h+8(FP), X0	// seed
-#endif
 	PINSRQ	$1, (AX), X0	// data
 	AESENC	runtime·aeskeysched+0(SB), X0
 	AESENC	runtime·aeskeysched+16(SB), X0
 	AESENC	runtime·aeskeysched+32(SB), X0
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	X0, AX	// return X0
-#else
-	MOVQ	X0, ret+16(FP)
-#endif
 	RET
 noaes:
 	JMP	runtime·memhash64Fallback<ABIInternal>(SB)
@@ -1577,7 +1696,7 @@ TEXT _cgo_topofstack(SB),NOSPLIT,$0
 
 // The top-most function running on a goroutine
 // returns to goexit+PCQuantum.
-TEXT runtime·goexit(SB),NOSPLIT|TOPFRAME,$0-0
+TEXT runtime·goexit(SB),NOSPLIT|TOPFRAME|NOFRAME,$0-0
 	BYTE	$0x90	// NOP
 	CALL	runtime·goexit1(SB)	// does not return
 	// traceback from goexit1 must hit code range of goexit
@@ -1596,59 +1715,56 @@ TEXT runtime·addmoduledata(SB),NOSPLIT,$0-0
 // This function is injected from the signal handler for panicking
 // signals. It is quite painful to set X15 in the signal context,
 // so we do it here.
-TEXT ·sigpanic0<ABIInternal>(SB),NOSPLIT,$0-0
-#ifdef GOEXPERIMENT_regabig
+TEXT ·sigpanic0(SB),NOSPLIT,$0-0
 	get_tls(R14)
 	MOVQ	g(R14), R14
+#ifndef GOOS_plan9
 	XORPS	X15, X15
 #endif
 	JMP	·sigpanic<ABIInternal>(SB)
 
-// gcWriteBarrier performs a heap pointer write and informs the GC.
+// gcWriteBarrier informs the GC about heap pointer writes.
 //
-// gcWriteBarrier does NOT follow the Go ABI. It takes two arguments:
-// - DI is the destination of the write
-// - AX is the value being written at DI
+// gcWriteBarrier returns space in a write barrier buffer which
+// should be filled in by the caller.
+// gcWriteBarrier does NOT follow the Go ABI. It accepts the
+// number of bytes of buffer needed in R11, and returns a pointer
+// to the buffer space in R11.
 // It clobbers FLAGS. It does not clobber any general-purpose registers,
 // but may clobber others (e.g., SSE registers).
-// Defined as ABIInternal since it does not use the stack-based Go ABI.
-TEXT runtime·gcWriteBarrier<ABIInternal>(SB),NOSPLIT,$112
+// Typical use would be, when doing *(CX+88) = AX
+//     CMPL    $0, runtime.writeBarrier(SB)
+//     JEQ     dowrite
+//     CALL    runtime.gcBatchBarrier2(SB)
+//     MOVQ    AX, (R11)
+//     MOVQ    88(CX), DX
+//     MOVQ    DX, 8(R11)
+// dowrite:
+//     MOVQ    AX, 88(CX)
+TEXT gcWriteBarrier<>(SB),NOSPLIT,$112
 	// Save the registers clobbered by the fast path. This is slightly
 	// faster than having the caller spill these.
 	MOVQ	R12, 96(SP)
 	MOVQ	R13, 104(SP)
+retry:
 	// TODO: Consider passing g.m.p in as an argument so they can be shared
 	// across a sequence of write barriers.
-#ifdef GOEXPERIMENT_regabig
 	MOVQ	g_m(R14), R13
-#else
-	get_tls(R13)
-	MOVQ	g(R13), R13
-	MOVQ	g_m(R13), R13
-#endif
 	MOVQ	m_p(R13), R13
-	MOVQ	(p_wbBuf+wbBuf_next)(R13), R12
-	// Increment wbBuf.next position.
-	LEAQ	16(R12), R12
-	MOVQ	R12, (p_wbBuf+wbBuf_next)(R13)
+	// Get current buffer write position.
+	MOVQ	(p_wbBuf+wbBuf_next)(R13), R12	// original next position
+	ADDQ	R11, R12			// new next position
+	// Is the buffer full?
 	CMPQ	R12, (p_wbBuf+wbBuf_end)(R13)
-	// Record the write.
-	MOVQ	AX, -16(R12)	// Record value
-	// Note: This turns bad pointer writes into bad
-	// pointer reads, which could be confusing. We could avoid
-	// reading from obviously bad pointers, which would
-	// take care of the vast majority of these. We could
-	// patch this up in the signal handler, or use XCHG to
-	// combine the read and the write.
-	MOVQ	(DI), R13
-	MOVQ	R13, -8(R12)	// Record *slot
-	// Is the buffer full? (flags set in CMPQ above)
-	JEQ	flush
-ret:
+	JA	flush
+	// Commit to the larger buffer.
+	MOVQ	R12, (p_wbBuf+wbBuf_next)(R13)
+	// Make return value (the original next position)
+	SUBQ	R11, R12
+	MOVQ	R12, R11
+	// Restore registers.
 	MOVQ	96(SP), R12
 	MOVQ	104(SP), R13
-	// Do the write.
-	MOVQ	AX, (DI)
 	RET
 
 flush:
@@ -1664,8 +1780,8 @@ flush:
 	//
 	// TODO: We could strike a different balance; e.g., saving X0
 	// and not saving GP registers that are less likely to be used.
-	MOVQ	DI, 0(SP)	// Also first argument to wbBufFlush
-	MOVQ	AX, 8(SP)	// Also second argument to wbBufFlush
+	MOVQ	DI, 0(SP)
+	MOVQ	AX, 8(SP)
 	MOVQ	BX, 16(SP)
 	MOVQ	CX, 24(SP)
 	MOVQ	DX, 32(SP)
@@ -1681,7 +1797,6 @@ flush:
 	// R14 is g
 	MOVQ	R15, 88(SP)
 
-	// This takes arguments DI and AX
 	CALL	runtime·wbBufFlush(SB)
 
 	MOVQ	0(SP), DI
@@ -1696,63 +1811,32 @@ flush:
 	MOVQ	72(SP), R10
 	MOVQ	80(SP), R11
 	MOVQ	88(SP), R15
-	JMP	ret
+	JMP	retry
 
-// gcWriteBarrierCX is gcWriteBarrier, but with args in DI and CX.
-// Defined as ABIInternal since it does not use the stable Go ABI.
-TEXT runtime·gcWriteBarrierCX<ABIInternal>(SB),NOSPLIT,$0
-	XCHGQ CX, AX
-	CALL runtime·gcWriteBarrier<ABIInternal>(SB)
-	XCHGQ CX, AX
-	RET
-
-// gcWriteBarrierDX is gcWriteBarrier, but with args in DI and DX.
-// Defined as ABIInternal since it does not use the stable Go ABI.
-TEXT runtime·gcWriteBarrierDX<ABIInternal>(SB),NOSPLIT,$0
-	XCHGQ DX, AX
-	CALL runtime·gcWriteBarrier<ABIInternal>(SB)
-	XCHGQ DX, AX
-	RET
-
-// gcWriteBarrierBX is gcWriteBarrier, but with args in DI and BX.
-// Defined as ABIInternal since it does not use the stable Go ABI.
-TEXT runtime·gcWriteBarrierBX<ABIInternal>(SB),NOSPLIT,$0
-	XCHGQ BX, AX
-	CALL runtime·gcWriteBarrier<ABIInternal>(SB)
-	XCHGQ BX, AX
-	RET
-
-// gcWriteBarrierBP is gcWriteBarrier, but with args in DI and BP.
-// Defined as ABIInternal since it does not use the stable Go ABI.
-TEXT runtime·gcWriteBarrierBP<ABIInternal>(SB),NOSPLIT,$0
-	XCHGQ BP, AX
-	CALL runtime·gcWriteBarrier<ABIInternal>(SB)
-	XCHGQ BP, AX
-	RET
-
-// gcWriteBarrierSI is gcWriteBarrier, but with args in DI and SI.
-// Defined as ABIInternal since it does not use the stable Go ABI.
-TEXT runtime·gcWriteBarrierSI<ABIInternal>(SB),NOSPLIT,$0
-	XCHGQ SI, AX
-	CALL runtime·gcWriteBarrier<ABIInternal>(SB)
-	XCHGQ SI, AX
-	RET
-
-// gcWriteBarrierR8 is gcWriteBarrier, but with args in DI and R8.
-// Defined as ABIInternal since it does not use the stable Go ABI.
-TEXT runtime·gcWriteBarrierR8<ABIInternal>(SB),NOSPLIT,$0
-	XCHGQ R8, AX
-	CALL runtime·gcWriteBarrier<ABIInternal>(SB)
-	XCHGQ R8, AX
-	RET
-
-// gcWriteBarrierR9 is gcWriteBarrier, but with args in DI and R9.
-// Defined as ABIInternal since it does not use the stable Go ABI.
-TEXT runtime·gcWriteBarrierR9<ABIInternal>(SB),NOSPLIT,$0
-	XCHGQ R9, AX
-	CALL runtime·gcWriteBarrier<ABIInternal>(SB)
-	XCHGQ R9, AX
-	RET
+TEXT runtime·gcWriteBarrier1<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+	MOVL   $8, R11
+	JMP     gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier2<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+	MOVL   $16, R11
+	JMP     gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier3<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+	MOVL   $24, R11
+	JMP     gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier4<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+	MOVL   $32, R11
+	JMP     gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier5<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+	MOVL   $40, R11
+	JMP     gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier6<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+	MOVL   $48, R11
+	JMP     gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier7<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+	MOVL   $56, R11
+	JMP     gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier8<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+	MOVL   $64, R11
+	JMP     gcWriteBarrier<>(SB)
 
 DATA	debugCallFrameTooLarge<>+0x00(SB)/20, $"call frame too large"
 GLOBL	debugCallFrameTooLarge<>(SB), RODATA, $20	// Size duplicated below
@@ -1768,7 +1852,7 @@ GLOBL	debugCallFrameTooLarge<>(SB), RODATA, $20	// Size duplicated below
 // 2. Push the current PC on the stack (updating SP).
 // 3. Write the desired argument frame size at SP-16 (using the SP
 //    after step 2).
-// 4. Save all machine registers (including flags and XMM reigsters)
+// 4. Save all machine registers (including flags and XMM registers)
 //    so they can be restored later by the debugger.
 // 5. Set the PC to debugCallV2 and resume execution.
 //
@@ -1956,152 +2040,70 @@ TEXT runtime·debugCallPanicked(SB),NOSPLIT,$16-16
 // The tail call makes these stubs disappear in backtraces.
 // Defined as ABIInternal since they do not use the stack-based Go ABI.
 TEXT runtime·panicIndex<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, BX
-#else
-	MOVQ	AX, x+0(FP)
-	MOVQ	CX, y+8(FP)
-#endif
 	JMP	runtime·goPanicIndex<ABIInternal>(SB)
 TEXT runtime·panicIndexU<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, BX
-#else
-	MOVQ	AX, x+0(FP)
-	MOVQ	CX, y+8(FP)
-#endif
 	JMP	runtime·goPanicIndexU<ABIInternal>(SB)
 TEXT runtime·panicSliceAlen<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, AX
 	MOVQ	DX, BX
-#else
-	MOVQ	CX, x+0(FP)
-	MOVQ	DX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSliceAlen<ABIInternal>(SB)
 TEXT runtime·panicSliceAlenU<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, AX
 	MOVQ	DX, BX
-#else
-	MOVQ	CX, x+0(FP)
-	MOVQ	DX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSliceAlenU<ABIInternal>(SB)
 TEXT runtime·panicSliceAcap<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, AX
 	MOVQ	DX, BX
-#else
-	MOVQ	CX, x+0(FP)
-	MOVQ	DX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSliceAcap<ABIInternal>(SB)
 TEXT runtime·panicSliceAcapU<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, AX
 	MOVQ	DX, BX
-#else
-	MOVQ	CX, x+0(FP)
-	MOVQ	DX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSliceAcapU<ABIInternal>(SB)
 TEXT runtime·panicSliceB<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, BX
-#else
-	MOVQ	AX, x+0(FP)
-	MOVQ	CX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSliceB<ABIInternal>(SB)
 TEXT runtime·panicSliceBU<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, BX
-#else
-	MOVQ	AX, x+0(FP)
-	MOVQ	CX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSliceBU<ABIInternal>(SB)
 TEXT runtime·panicSlice3Alen<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	DX, AX
-#else
-	MOVQ	DX, x+0(FP)
-	MOVQ	BX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSlice3Alen<ABIInternal>(SB)
 TEXT runtime·panicSlice3AlenU<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	DX, AX
-#else
-	MOVQ	DX, x+0(FP)
-	MOVQ	BX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSlice3AlenU<ABIInternal>(SB)
 TEXT runtime·panicSlice3Acap<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	DX, AX
-#else
-	MOVQ	DX, x+0(FP)
-	MOVQ	BX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSlice3Acap<ABIInternal>(SB)
 TEXT runtime·panicSlice3AcapU<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	DX, AX
-#else
-	MOVQ	DX, x+0(FP)
-	MOVQ	BX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSlice3AcapU<ABIInternal>(SB)
 TEXT runtime·panicSlice3B<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, AX
 	MOVQ	DX, BX
-#else
-	MOVQ	CX, x+0(FP)
-	MOVQ	DX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSlice3B<ABIInternal>(SB)
 TEXT runtime·panicSlice3BU<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, AX
 	MOVQ	DX, BX
-#else
-	MOVQ	CX, x+0(FP)
-	MOVQ	DX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSlice3BU<ABIInternal>(SB)
 TEXT runtime·panicSlice3C<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, BX
-#else
-	MOVQ	AX, x+0(FP)
-	MOVQ	CX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSlice3C<ABIInternal>(SB)
 TEXT runtime·panicSlice3CU<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	CX, BX
-#else
-	MOVQ	AX, x+0(FP)
-	MOVQ	CX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSlice3CU<ABIInternal>(SB)
 TEXT runtime·panicSliceConvert<ABIInternal>(SB),NOSPLIT,$0-16
-#ifdef GOEXPERIMENT_regabiargs
 	MOVQ	DX, AX
-#else
-	MOVQ	DX, x+0(FP)
-	MOVQ	BX, y+8(FP)
-#endif
 	JMP	runtime·goPanicSliceConvert<ABIInternal>(SB)
 
 #ifdef GOOS_android
 // Use the free TLS_SLOT_APP slot #2 on Android Q.
 // Earlier androids are set up in gcc_android.c.
 DATA runtime·tls_g+0(SB)/8, $16
+GLOBL runtime·tls_g+0(SB), NOPTR, $8
+#endif
+#ifdef GOOS_windows
 GLOBL runtime·tls_g+0(SB), NOPTR, $8
 #endif
 
@@ -2119,19 +2121,23 @@ GLOBL runtime·tls_g+0(SB), NOPTR, $8
 	                        BYTE $0x04|((reg&7)<<3); BYTE $0x24;			\
 	/*   RET */             BYTE $0xC3
 
-TEXT runtime·retpolineAX(SB),NOSPLIT,$0; RETPOLINE(0)
-TEXT runtime·retpolineCX(SB),NOSPLIT,$0; RETPOLINE(1)
-TEXT runtime·retpolineDX(SB),NOSPLIT,$0; RETPOLINE(2)
-TEXT runtime·retpolineBX(SB),NOSPLIT,$0; RETPOLINE(3)
+TEXT runtime·retpolineAX(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(0)
+TEXT runtime·retpolineCX(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(1)
+TEXT runtime·retpolineDX(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(2)
+TEXT runtime·retpolineBX(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(3)
 /* SP is 4, can't happen / magic encodings */
-TEXT runtime·retpolineBP(SB),NOSPLIT,$0; RETPOLINE(5)
-TEXT runtime·retpolineSI(SB),NOSPLIT,$0; RETPOLINE(6)
-TEXT runtime·retpolineDI(SB),NOSPLIT,$0; RETPOLINE(7)
-TEXT runtime·retpolineR8(SB),NOSPLIT,$0; RETPOLINE(8)
-TEXT runtime·retpolineR9(SB),NOSPLIT,$0; RETPOLINE(9)
-TEXT runtime·retpolineR10(SB),NOSPLIT,$0; RETPOLINE(10)
-TEXT runtime·retpolineR11(SB),NOSPLIT,$0; RETPOLINE(11)
-TEXT runtime·retpolineR12(SB),NOSPLIT,$0; RETPOLINE(12)
-TEXT runtime·retpolineR13(SB),NOSPLIT,$0; RETPOLINE(13)
-TEXT runtime·retpolineR14(SB),NOSPLIT,$0; RETPOLINE(14)
-TEXT runtime·retpolineR15(SB),NOSPLIT,$0; RETPOLINE(15)
+TEXT runtime·retpolineBP(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(5)
+TEXT runtime·retpolineSI(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(6)
+TEXT runtime·retpolineDI(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(7)
+TEXT runtime·retpolineR8(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(8)
+TEXT runtime·retpolineR9(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(9)
+TEXT runtime·retpolineR10(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(10)
+TEXT runtime·retpolineR11(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(11)
+TEXT runtime·retpolineR12(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(12)
+TEXT runtime·retpolineR13(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(13)
+TEXT runtime·retpolineR14(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(14)
+TEXT runtime·retpolineR15(SB),NOSPLIT|NOFRAME,$0; RETPOLINE(15)
+
+TEXT ·getfp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+	MOVQ BP, AX
+	RET

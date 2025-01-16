@@ -5,9 +5,8 @@
 package runtime_test
 
 import (
-	"fmt"
-	"reflect"
 	"runtime"
+	"slices"
 	"testing"
 )
 
@@ -84,8 +83,8 @@ func TestConditionalDefers(t *testing.T) {
 			t.Fatal("expected panic")
 		}
 		want := []int{4, 2, 1}
-		if !reflect.DeepEqual(want, list) {
-			t.Fatal(fmt.Sprintf("wanted %v, got %v", want, list))
+		if !slices.Equal(want, list) {
+			t.Fatalf("wanted %v, got %v", want, list)
 		}
 
 	}()
@@ -133,13 +132,13 @@ func TestAbortedPanic(t *testing.T) {
 	defer func() {
 		r := recover()
 		if r != nil {
-			t.Fatal(fmt.Sprintf("wanted nil recover, got %v", r))
+			t.Fatalf("wanted nil recover, got %v", r)
 		}
 	}()
 	defer func() {
 		r := recover()
 		if r != "panic2" {
-			t.Fatal(fmt.Sprintf("wanted %v, got %v", "panic2", r))
+			t.Fatalf("wanted %v, got %v", "panic2", r)
 		}
 	}()
 	defer func() {
@@ -156,7 +155,7 @@ func TestRecoverMatching(t *testing.T) {
 	defer func() {
 		r := recover()
 		if r != "panic1" {
-			t.Fatal(fmt.Sprintf("wanted %v, got %v", "panic1", r))
+			t.Fatalf("wanted %v, got %v", "panic1", r)
 		}
 	}()
 	defer func() {
@@ -166,7 +165,7 @@ func TestRecoverMatching(t *testing.T) {
 			// not directly called by the panic.
 			r := recover()
 			if r != nil {
-				t.Fatal(fmt.Sprintf("wanted nil recover, got %v", r))
+				t.Fatalf("wanted nil recover, got %v", r)
 			}
 		}()
 	}()
@@ -213,25 +212,25 @@ func TestNonSSAableArgs(t *testing.T) {
 
 	defer func() {
 		if globint1 != 1 {
-			t.Fatal(fmt.Sprintf("globint1:  wanted: 1, got %v", globint1))
+			t.Fatalf("globint1:  wanted: 1, got %v", globint1)
 		}
 		if save1 != 5 {
-			t.Fatal(fmt.Sprintf("save1:  wanted: 5, got %v", save1))
+			t.Fatalf("save1:  wanted: 5, got %v", save1)
 		}
 		if globint2 != 1 {
-			t.Fatal(fmt.Sprintf("globint2:  wanted: 1, got %v", globint2))
+			t.Fatalf("globint2:  wanted: 1, got %v", globint2)
 		}
 		if save2 != 2 {
-			t.Fatal(fmt.Sprintf("save2:  wanted: 2, got %v", save2))
+			t.Fatalf("save2:  wanted: 2, got %v", save2)
 		}
 		if save3 != 4 {
-			t.Fatal(fmt.Sprintf("save3:  wanted: 4, got %v", save3))
+			t.Fatalf("save3:  wanted: 4, got %v", save3)
 		}
 		if globint3 != 1 {
-			t.Fatal(fmt.Sprintf("globint3:  wanted: 1, got %v", globint3))
+			t.Fatalf("globint3:  wanted: 1, got %v", globint3)
 		}
 		if save4 != 4 {
-			t.Fatal(fmt.Sprintf("save1:  wanted: 4, got %v", save4))
+			t.Fatalf("save1:  wanted: 4, got %v", save4)
 		}
 	}()
 
@@ -264,7 +263,7 @@ func TestDeferForFuncWithNoExit(t *testing.T) {
 	cond := 1
 	defer func() {
 		if cond != 2 {
-			t.Fatal(fmt.Sprintf("cond: wanted 2, got %v", cond))
+			t.Fatalf("cond: wanted 2, got %v", cond)
 		}
 		if recover() != "Test panic" {
 			t.Fatal("Didn't find expected panic")
@@ -433,8 +432,86 @@ func TestIssue43921(t *testing.T) {
 	}()
 }
 
-func expect(t *testing.T, n int, err interface{}) {
+func expect(t *testing.T, n int, err any) {
 	if n != err {
 		t.Fatalf("have %v, want %v", err, n)
 	}
+}
+
+func TestIssue43920(t *testing.T) {
+	var steps int
+
+	defer func() {
+		expect(t, 1, recover())
+	}()
+	defer func() {
+		defer func() {
+			defer func() {
+				expect(t, 5, recover())
+			}()
+			defer panic(5)
+			func() {
+				panic(4)
+			}()
+		}()
+		defer func() {
+			expect(t, 3, recover())
+		}()
+		defer panic(3)
+	}()
+	func() {
+		defer step(t, &steps, 1)
+		panic(1)
+	}()
+}
+
+func step(t *testing.T, steps *int, want int) {
+	*steps++
+	if *steps != want {
+		t.Fatalf("have %v, want %v", *steps, want)
+	}
+}
+
+func TestIssue43941(t *testing.T) {
+	var steps int = 7
+	defer func() {
+		step(t, &steps, 14)
+		expect(t, 4, recover())
+	}()
+	func() {
+		func() {
+			defer func() {
+				defer func() {
+					expect(t, 3, recover())
+				}()
+				defer panic(3)
+				panic(2)
+			}()
+			defer func() {
+				expect(t, 1, recover())
+			}()
+			defer panic(1)
+		}()
+		defer func() {}()
+		defer func() {}()
+		defer step(t, &steps, 10)
+		defer step(t, &steps, 9)
+		step(t, &steps, 8)
+	}()
+	func() {
+		defer step(t, &steps, 13)
+		defer step(t, &steps, 12)
+		func() {
+			defer step(t, &steps, 11)
+			panic(4)
+		}()
+
+		// Code below isn't executed,
+		// but removing it breaks the test case.
+		defer func() {}()
+		defer panic(-1)
+		defer step(t, &steps, -1)
+		defer step(t, &steps, -1)
+		defer func() {}()
+	}()
 }

@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build ignore
-// +build ignore
 
 // encgen writes the helper functions for encoding. Intended to be
 // used with go generate; see the invocation in encode.go.
@@ -169,6 +168,9 @@ func main() {
 		log.Fatal(err)
 	}
 	if _, err := fd.Write(source); err != nil {
+		log.Fatal(err)
+	}
+	if err := fd.Close(); err != nil {
 		log.Fatal(err)
 	}
 }

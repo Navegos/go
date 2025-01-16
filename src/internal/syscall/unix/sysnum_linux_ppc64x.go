@@ -3,11 +3,13 @@
 // license that can be found in the LICENSE file.
 
 //go:build ppc64 || ppc64le
-// +build ppc64 ppc64le
 
 package unix
 
 const (
-	getrandomTrap     uintptr = 359
-	copyFileRangeTrap uintptr = 379
+	getrandomTrap       uintptr = 359
+	copyFileRangeTrap   uintptr = 379
+	pidfdSendSignalTrap uintptr = 424
+	pidfdOpenTrap       uintptr = 434
+	openat2Trap         uintptr = 437
 )

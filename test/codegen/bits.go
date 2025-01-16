@@ -6,6 +6,8 @@
 
 package codegen
 
+import "math/bits"
+
 /************************************
  * 64-bit instructions
  ************************************/
@@ -218,10 +220,10 @@ func biton32(a, b uint32) (n uint32) {
 	// amd64:"BTSL"
 	n += b | (1 << (a & 31))
 
-	// amd64:"BTSL\t[$]31"
+	// amd64:"ORL\t[$]-2147483648"
 	n += a | (1 << 31)
 
-	// amd64:"BTSL\t[$]28"
+	// amd64:"ORL\t[$]268435456"
 	n += a | (1 << 28)
 
 	// amd64:"ORL\t[$]1"
@@ -234,10 +236,10 @@ func bitoff32(a, b uint32) (n uint32) {
 	// amd64:"BTRL"
 	n += b &^ (1 << (a & 31))
 
-	// amd64:"BTRL\t[$]31"
+	// amd64:"ANDL\t[$]2147483647"
 	n += a &^ (1 << 31)
 
-	// amd64:"BTRL\t[$]28"
+	// amd64:"ANDL\t[$]-268435457"
 	n += a &^ (1 << 28)
 
 	// amd64:"ANDL\t[$]-2"
@@ -250,10 +252,10 @@ func bitcompl32(a, b uint32) (n uint32) {
 	// amd64:"BTCL"
 	n += b ^ (1 << (a & 31))
 
-	// amd64:"BTCL\t[$]31"
+	// amd64:"XORL\t[$]-2147483648"
 	n += a ^ (1 << 31)
 
-	// amd64:"BTCL\t[$]28"
+	// amd64:"XORL\t[$]268435456"
 	n += a ^ (1 << 28)
 
 	// amd64:"XORL\t[$]1"
@@ -270,18 +272,6 @@ func bitOpOnMem(a []uint32, b, c, d uint32) {
 	a[1] |= 220
 	// amd64:`XORL\s[$]240,\s8\([A-Z][A-Z0-9]+\)`
 	a[2] ^= 240
-	// amd64:`BTRL\s[$]15,\s12\([A-Z][A-Z0-9]+\)`,-`ANDL`
-	a[3] &= 0xffff7fff
-	// amd64:`BTSL\s[$]14,\s16\([A-Z][A-Z0-9]+\)`,-`ORL`
-	a[4] |= 0x4000
-	// amd64:`BTCL\s[$]13,\s20\([A-Z][A-Z0-9]+\)`,-`XORL`
-	a[5] ^= 0x2000
-	// amd64:`BTRL\s[A-Z][A-Z0-9]+,\s24\([A-Z][A-Z0-9]+\)`
-	a[6] &^= 1 << (b & 31)
-	// amd64:`BTSL\s[A-Z][A-Z0-9]+,\s28\([A-Z][A-Z0-9]+\)`
-	a[7] |= 1 << (c & 31)
-	// amd64:`BTCL\s[A-Z][A-Z0-9]+,\s32\([A-Z][A-Z0-9]+\)`
-	a[8] ^= 1 << (d & 31)
 }
 
 func bitcheckMostNegative(b uint8) bool {
@@ -342,7 +332,7 @@ func bitSetPowerOf2Test(x int) bool {
 }
 
 func bitSetTest(x int) bool {
-	// amd64:"ANDQ\t[$]9, AX"
+	// amd64:"ANDL\t[$]9, AX"
 	// amd64:"CMPQ\tAX, [$]9"
 	return x&9 == 9
 }
@@ -366,4 +356,69 @@ func issue44228a(a []int64, i int) bool {
 func issue44228b(a []int32, i int) bool {
 	// amd64: "BTL", -"SHL"
 	return a[i>>5]&(1<<(i&31)) != 0
+}
+
+func issue48467(x, y uint64) uint64 {
+	// arm64: -"NEG"
+	d, borrow := bits.Sub64(x, y, 0)
+	return x - d&(-borrow)
+}
+
+func foldConst(x, y uint64) uint64 {
+	// arm64: "ADDS\t[$]7",-"MOVD\t[$]7"
+	// ppc64x: "ADDC\t[$]7,"
+	d, b := bits.Add64(x, 7, 0)
+	return b & d
+}
+
+func foldConstOutOfRange(a uint64) uint64 {
+	// arm64: "MOVD\t[$]19088744",-"ADD\t[$]19088744"
+	return a + 0x1234568
+}
+
+// Verify sign-extended values are not zero-extended under a bit mask (#61297)
+func signextendAndMask8to64(a int8) (s, z uint64) {
+	// ppc64x: "MOVB", "ANDCC\t[$]1015,"
+	s = uint64(a) & 0x3F7
+	// ppc64x: -"MOVB", "ANDCC\t[$]247,"
+	z = uint64(uint8(a)) & 0x3F7
+	return
+}
+
+// Verify zero-extended values are not sign-extended under a bit mask (#61297)
+func zeroextendAndMask8to64(a int8, b int16) (x, y uint64) {
+	// ppc64x: -"MOVB\t", -"ANDCC", "MOVBZ"
+	x = uint64(a) & 0xFF
+	// ppc64x: -"MOVH\t", -"ANDCC", "MOVHZ"
+	y = uint64(b) & 0xFFFF
+	return
+}
+
+// Verify rotate and mask instructions, and further simplified instructions for small types
+func bitRotateAndMask(io64 [8]uint64, io32 [4]uint32, io16 [4]uint16, io8 [4]uint8) {
+	// ppc64x: "RLDICR\t[$]0, R[0-9]*, [$]47, R"
+	io64[0] = io64[0] & 0xFFFFFFFFFFFF0000
+	// ppc64x: "RLDICL\t[$]0, R[0-9]*, [$]16, R"
+	io64[1] = io64[1] & 0x0000FFFFFFFFFFFF
+	// ppc64x: -"SRD", -"AND", "RLDICL\t[$]60, R[0-9]*, [$]16, R"
+	io64[2] = (io64[2] >> 4) & 0x0000FFFFFFFFFFFF
+	// ppc64x: -"SRD", -"AND", "RLDICL\t[$]36, R[0-9]*, [$]28, R"
+	io64[3] = (io64[3] >> 28) & 0x0000FFFFFFFFFFFF
+
+	// ppc64x: "MOVWZ", "RLWNM\t[$]1, R[0-9]*, [$]28, [$]3, R"
+	io64[4] = uint64(bits.RotateLeft32(io32[0], 1) & 0xF000000F)
+
+	// ppc64x: "RLWNM\t[$]0, R[0-9]*, [$]4, [$]19, R"
+	io32[0] = io32[0] & 0x0FFFF000
+	// ppc64x: "RLWNM\t[$]0, R[0-9]*, [$]20, [$]3, R"
+	io32[1] = io32[1] & 0xF0000FFF
+	// ppc64x: -"RLWNM", MOVD, AND
+	io32[2] = io32[2] & 0xFFFF0002
+
+	var bigc uint32 = 0x12345678
+	// ppc64x: "ANDCC\t[$]22136"
+	io16[0] = io16[0] & uint16(bigc)
+
+	// ppc64x: "ANDCC\t[$]120"
+	io8[0] = io8[0] & uint8(bigc)
 }

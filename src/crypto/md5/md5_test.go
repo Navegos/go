@@ -6,6 +6,7 @@ package md5
 
 import (
 	"bytes"
+	"crypto/internal/cryptotest"
 	"crypto/rand"
 	"encoding"
 	"fmt"
@@ -68,7 +69,7 @@ func TestGolden(t *testing.T) {
 			if j < 2 {
 				io.WriteString(c, g.in)
 			} else if j == 2 {
-				io.WriteString(c, g.in[0:len(g.in)/2])
+				io.WriteString(c, g.in[:len(g.in)/2])
 				c.Sum(nil)
 				io.WriteString(c, g.in[len(g.in)/2:])
 			} else if j > 2 {
@@ -99,8 +100,20 @@ func TestGoldenMarshal(t *testing.T) {
 			continue
 		}
 
+		stateAppend, err := h.(encoding.BinaryAppender).AppendBinary(make([]byte, 4, 32))
+		if err != nil {
+			t.Errorf("could not marshal: %v", err)
+			continue
+		}
+		stateAppend = stateAppend[4:]
+
 		if string(state) != g.halfState {
 			t.Errorf("md5(%q) state = %q, want %q", g.in, state, g.halfState)
+			continue
+		}
+
+		if string(stateAppend) != g.halfState {
+			t.Errorf("md5(%q) stateAppend = %q, want %q", g.in, stateAppend, g.halfState)
 			continue
 		}
 
@@ -209,6 +222,25 @@ func TestLargeHashes(t *testing.T) {
 			t.Errorf("test %d sum mismatch: expect %s got %x", i, test.sum, sum)
 		}
 	}
+}
+
+func TestAllocations(t *testing.T) {
+	cryptotest.SkipTestAllocations(t)
+	in := []byte("hello, world!")
+	out := make([]byte, 0, Size)
+	h := New()
+	n := int(testing.AllocsPerRun(10, func() {
+		h.Reset()
+		h.Write(in)
+		out = h.Sum(out[:0])
+	}))
+	if n > 0 {
+		t.Errorf("allocs = %d, want 0", n)
+	}
+}
+
+func TestMD5Hash(t *testing.T) {
+	cryptotest.TestHash(t, New)
 }
 
 var bench = New()

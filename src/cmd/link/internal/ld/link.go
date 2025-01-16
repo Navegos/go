@@ -33,7 +33,6 @@ package ld
 import (
 	"bufio"
 	"cmd/internal/objabi"
-	"cmd/internal/sys"
 	"cmd/link/internal/loader"
 	"cmd/link/internal/sym"
 	"debug/elf"
@@ -45,7 +44,31 @@ type Shlib struct {
 	Hash []byte
 	Deps []string
 	File *elf.File
+	// For every symbol defined in the shared library, record its address
+	// in the original shared library address space.
+	symAddr map[string]uint64
+	// For relocations in the shared library, map from the address
+	// (in the shared library address space) at which that
+	// relocation applies to the target symbol.  We only keep
+	// track of a single kind of relocation: a standard absolute
+	// address relocation with no addend. These were R_ADDR
+	// relocations when the shared library was built.
+	relocTarget map[uint64]string
 }
+
+// A relocation that applies to part of the shared library.
+type shlibReloc struct {
+	// Address (in the shared library address space) the relocation applies to.
+	addr uint64
+	// Target symbol name.
+	target string
+}
+
+type shlibRelocs []shlibReloc
+
+func (s shlibRelocs) Len() int           { return len(s) }
+func (s shlibRelocs) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s shlibRelocs) Less(i, j int) bool { return s[i].addr < s[j].addr }
 
 // Link holds the context for writing object code from a compiler
 // or for reading that input into the linker.
@@ -103,23 +126,6 @@ type cgodata struct {
 	directives [][]string
 }
 
-// The smallest possible offset from the hardware stack pointer to a local
-// variable on the stack. Architectures that use a link register save its value
-// on the stack in the function prologue and so always have a pointer between
-// the hardware stack pointer and the local variable area.
-func (ctxt *Link) FixedFrameSize() int64 {
-	switch ctxt.Arch.Family {
-	case sys.AMD64, sys.I386:
-		return 0
-	case sys.PPC64:
-		// PIC code on ppc64le requires 32 bytes of stack, and it's easier to
-		// just use that much stack always on ppc64x.
-		return int64(4 * ctxt.Arch.PtrSize)
-	default:
-		return int64(ctxt.Arch.PtrSize)
-	}
-}
-
 func (ctxt *Link) Logf(format string, args ...interface{}) {
 	fmt.Fprintf(ctxt.Bso, format, args...)
 	ctxt.Bso.Flush()
@@ -148,12 +154,18 @@ func (ctxt *Link) MaxVersion() int {
 }
 
 // generatorFunc is a convenience type.
-// Linker created symbols that are large, and shouldn't really live in the
-// heap can define a generator function, and their bytes can be generated
+// Some linker-created Symbols are large and shouldn't really live in the heap.
+// Such Symbols can define a generator function. Their bytes can be generated
 // directly in the output mmap.
 //
-// Generator symbols shouldn't grow the symbol size, and might be called in
-// parallel in the future.
+// Relocations are applied prior to emitting generator Symbol contents.
+// Generator Symbols that require relocations can be written in two passes.
+// The first pass, at Symbol creation time, adds only relocations.
+// The second pass, at content generation time, adds the rest.
+// See generateFunctab for an example.
+//
+// Generator functions shouldn't grow the Symbol size.
+// Generator functions must be safe for concurrent use.
 //
 // Generator Symbols have their Data set to the mmapped area when the
 // generator is called.

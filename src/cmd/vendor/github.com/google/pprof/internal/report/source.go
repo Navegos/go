@@ -58,6 +58,10 @@ func printSource(w io.Writer, rpt *Report) error {
 	}
 	functions.Sort(graph.NameOrder)
 
+	if len(functionNodes) == 0 {
+		return fmt.Errorf("no matches found for regexp: %s", o.Symbol)
+	}
+
 	sourcePath := o.SourcePath
 	if sourcePath == "" {
 		wd, err := os.Getwd()
@@ -118,20 +122,10 @@ func printSource(w io.Writer, rpt *Report) error {
 	return nil
 }
 
-// printWebSource prints an annotated source listing, include all
-// functions with samples that match the regexp rpt.options.symbol.
-func printWebSource(w io.Writer, rpt *Report, obj plugin.ObjTool) error {
-	printHeader(w, rpt)
-	if err := PrintWebList(w, rpt, obj, -1); err != nil {
-		return err
-	}
-	printPageClosing(w)
-	return nil
-}
-
 // sourcePrinter holds state needed for generating source+asm HTML listing.
 type sourcePrinter struct {
 	reader     *sourceReader
+	synth      *synthCode
 	objectTool plugin.ObjTool
 	objects    map[string]plugin.ObjFile  // Opened object files
 	sym        *regexp.Regexp             // May be nil
@@ -144,6 +138,12 @@ type sourcePrinter struct {
 
 	// Mapping from system function names to printable names.
 	prettyNames map[string]string
+}
+
+// addrInfo holds information for an address we are interested in.
+type addrInfo struct {
+	loc *profile.Location // Always non-nil
+	obj plugin.ObjFile    // May be nil
 }
 
 // instructionInfo holds collected information for an instruction.
@@ -187,26 +187,79 @@ type addressRange struct {
 	score      int64 // Used to order ranges for processing
 }
 
-// PrintWebList prints annotated source listing of rpt to w.
+// WebListData holds the data needed to generate HTML source code listing.
+type WebListData struct {
+	Total string
+	Files []WebListFile
+}
+
+// WebListFile holds the per-file information for HTML source code listing.
+type WebListFile struct {
+	Funcs []WebListFunc
+}
+
+// WebListFunc holds the per-function information for HTML source code listing.
+type WebListFunc struct {
+	Name       string
+	File       string
+	Flat       string
+	Cumulative string
+	Percent    string
+	Lines      []WebListLine
+}
+
+// WebListLine holds the per-source-line information for HTML source code listing.
+type WebListLine struct {
+	SrcLine      string
+	HTMLClass    string
+	Line         int
+	Flat         string
+	Cumulative   string
+	Instructions []WebListInstruction
+}
+
+// WebListInstruction holds the per-instruction information for HTML source code listing.
+type WebListInstruction struct {
+	NewBlock     bool // Insert marker that indicates separation from previous block
+	Flat         string
+	Cumulative   string
+	Synthetic    bool
+	Address      uint64
+	Disasm       string
+	FileLine     string
+	InlinedCalls []WebListCall
+}
+
+// WebListCall holds the per-inlined-call information for HTML source code listing.
+type WebListCall struct {
+	SrcLine  string
+	FileBase string
+	Line     int
+}
+
+// MakeWebList returns an annotated source listing of rpt.
 // rpt.prof should contain inlined call info.
-func PrintWebList(w io.Writer, rpt *Report, obj plugin.ObjTool, maxFiles int) error {
+func MakeWebList(rpt *Report, obj plugin.ObjTool, maxFiles int) (WebListData, error) {
 	sourcePath := rpt.options.SourcePath
 	if sourcePath == "" {
 		wd, err := os.Getwd()
 		if err != nil {
-			return fmt.Errorf("could not stat current dir: %v", err)
+			return WebListData{}, fmt.Errorf("could not stat current dir: %v", err)
 		}
 		sourcePath = wd
 	}
 	sp := newSourcePrinter(rpt, obj, sourcePath)
-	sp.print(w, maxFiles, rpt)
-	sp.close()
-	return nil
+	if len(sp.interest) == 0 {
+		return WebListData{}, fmt.Errorf("no matches found for regexp: %s", rpt.options.Symbol)
+	}
+	defer sp.close()
+	return sp.generate(maxFiles, rpt), nil
 }
 
 func newSourcePrinter(rpt *Report, obj plugin.ObjTool, sourcePath string) *sourcePrinter {
 	sp := &sourcePrinter{
 		reader:      newSourceReader(sourcePath, rpt.options.TrimPath),
+		synth:       newSynthCode(rpt.prof.Mapping),
 		objectTool:  obj,
 		objects:     map[string]plugin.ObjFile{},
 		sym:         rpt.options.Symbol,
@@ -225,19 +278,21 @@ func newSourcePrinter(rpt *Report, obj plugin.ObjTool, sourcePath string) *sourc
 		}
 	}
 
-	addrs := map[uint64]bool{}
+	addrs := map[uint64]addrInfo{}
 	flat := map[uint64]int64{}
 	cum := map[uint64]int64{}
 
 	// Record an interest in the function corresponding to lines[index].
-	markInterest := func(addr uint64, lines []profile.Line, index int) {
-		fn := lines[index]
+	markInterest := func(addr uint64, loc *profile.Location, index int) {
+		fn := loc.Line[index]
 		if fn.Function == nil {
 			return
 		}
 		sp.interest[fn.Function.Name] = true
 		sp.interest[fn.Function.SystemName] = true
-		addrs[addr] = true
+		if _, ok := addrs[addr]; !ok {
+			addrs[addr] = addrInfo{loc, sp.objectFile(loc.Mapping)}
+		}
 	}
 
 	// See if sp.sym matches line.
@@ -270,24 +325,30 @@ func newSourcePrinter(rpt *Report, obj plugin.ObjTool, sourcePath string) *sourc
 				sp.prettyNames[line.Function.SystemName] = line.Function.Name
 			}
 
-			cum[loc.Address] += value
-			if i == 0 {
-				flat[loc.Address] += value
+			addr := loc.Address
+			if addr == 0 {
+				// Some profiles are missing valid addresses.
+				addr = sp.synth.address(loc)
 			}
 
-			if sp.sym == nil || (address != nil && loc.Address == *address) {
+			cum[addr] += value
+			if i == 0 {
+				flat[addr] += value
+			}
+
+			if sp.sym == nil || (address != nil && addr == *address) {
 				// Interested in top-level entry of stack.
 				if len(loc.Line) > 0 {
-					markInterest(loc.Address, loc.Line, len(loc.Line)-1)
+					markInterest(addr, loc, len(loc.Line)-1)
 				}
 				continue
 			}
 
-			// Seach in inlined stack for a match.
+			// Search in inlined stack for a match.
 			matchFile := (loc.Mapping != nil && sp.sym.MatchString(loc.Mapping.File))
 			for j, line := range loc.Line {
 				if (j == 0 && matchFile) || matches(line) {
-					markInterest(loc.Address, loc.Line, j)
+					markInterest(addr, loc, j)
 				}
 			}
 		}
@@ -306,10 +367,11 @@ func (sp *sourcePrinter) close() {
 	}
 }
 
-func (sp *sourcePrinter) expandAddresses(rpt *Report, addrs map[uint64]bool, flat map[uint64]int64) {
+func (sp *sourcePrinter) expandAddresses(rpt *Report, addrs map[uint64]addrInfo, flat map[uint64]int64) {
 	// We found interesting addresses (ones with non-zero samples) above.
 	// Get covering address ranges and disassemble the ranges.
-	ranges := sp.splitIntoRanges(rpt.prof, addrs, flat)
+	ranges, unprocessed := sp.splitIntoRanges(rpt.prof, addrs, flat)
+	sp.handleUnprocessed(addrs, unprocessed)
 
 	// Trim ranges if there are too many.
 	const maxRanges = 25
@@ -321,9 +383,18 @@ func (sp *sourcePrinter) expandAddresses(rpt *Report, addrs map[uint64]bool, fla
 	}
 
 	for _, r := range ranges {
-		base := r.obj.Base()
-		insts, err := sp.objectTool.Disasm(r.mapping.File, r.begin-base, r.end-base,
-			rpt.options.IntelSyntax)
+		objBegin, err := r.obj.ObjAddr(r.begin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to compute objdump address for range start %x: %v\n", r.begin, err)
+			continue
+		}
+		objEnd, err := r.obj.ObjAddr(r.end)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to compute objdump address for range end %x: %v\n", r.end, err)
+			continue
+		}
+		base := r.begin - objBegin
+		insts, err := sp.objectTool.Disasm(r.mapping.File, objBegin, objEnd, rpt.options.IntelSyntax)
 		if err != nil {
 			// TODO(sanjay): Report that the covered addresses are missing.
 			continue
@@ -385,78 +456,115 @@ func (sp *sourcePrinter) expandAddresses(rpt *Report, addrs map[uint64]bool, fla
 				frames = lastFrames
 			}
 
-			// See if the stack contains a function we are interested in.
-			for i, f := range frames {
-				if !sp.interest[f.Func] {
-					continue
-				}
-
-				// Record sub-stack under frame's file/line.
-				fname := canonicalizeFileName(f.File)
-				file := sp.files[fname]
-				if file == nil {
-					file = &sourceFile{
-						fname:    fname,
-						lines:    map[int][]sourceInst{},
-						funcName: map[int]string{},
-					}
-					sp.files[fname] = file
-				}
-				callees := frames[:i]
-				stack := make([]callID, 0, len(callees))
-				for j := len(callees) - 1; j >= 0; j-- { // Reverse so caller is first
-					stack = append(stack, callID{
-						file: callees[j].File,
-						line: callees[j].Line,
-					})
-				}
-				file.lines[f.Line] = append(file.lines[f.Line], sourceInst{addr, stack})
-
-				// Remember the first function name encountered per source line
-				// and assume that that line belongs to that function.
-				if _, ok := file.funcName[f.Line]; !ok {
-					file.funcName[f.Line] = f.Func
-				}
-			}
+			sp.addStack(addr, frames)
 		}
 	}
 }
 
-// splitIntoRanges converts the set of addresses we are interested in into a set of address
-// ranges to disassemble.
-func (sp *sourcePrinter) splitIntoRanges(prof *profile.Profile, set map[uint64]bool, flat map[uint64]int64) []addressRange {
-	// List of mappings so we can stop expanding address ranges at mapping boundaries.
-	mappings := append([]*profile.Mapping{}, prof.Mapping...)
-	sort.Slice(mappings, func(i, j int) bool { return mappings[i].Start < mappings[j].Start })
+func (sp *sourcePrinter) addStack(addr uint64, frames []plugin.Frame) {
+	// See if the stack contains a function we are interested in.
+	for i, f := range frames {
+		if !sp.interest[f.Func] {
+			continue
+		}
 
-	var result []addressRange
-	addrs := make([]uint64, 0, len(set))
-	for addr := range set {
-		addrs = append(addrs, addr)
+		// Record sub-stack under frame's file/line.
+		fname := canonicalizeFileName(f.File)
+		file := sp.files[fname]
+		if file == nil {
+			file = &sourceFile{
+				fname:    fname,
+				lines:    map[int][]sourceInst{},
+				funcName: map[int]string{},
+			}
+			sp.files[fname] = file
+		}
+		callees := frames[:i]
+		stack := make([]callID, 0, len(callees))
+		for j := len(callees) - 1; j >= 0; j-- { // Reverse so caller is first
+			stack = append(stack, callID{
+				file: callees[j].File,
+				line: callees[j].Line,
+			})
+		}
+		file.lines[f.Line] = append(file.lines[f.Line], sourceInst{addr, stack})
+
+		// Remember the first function name encountered per source line
+		// and assume that that line belongs to that function.
+		if _, ok := file.funcName[f.Line]; !ok {
+			file.funcName[f.Line] = f.Func
+		}
+	}
+}
+
+// synthAsm is the special disassembler value used for instructions without an object file.
+const synthAsm = ""
+
+// handleUnprocessed handles addresses that were skipped by splitIntoRanges because they
+// did not belong to a known object file.
+func (sp *sourcePrinter) handleUnprocessed(addrs map[uint64]addrInfo, unprocessed []uint64) {
+	// makeFrames synthesizes a []plugin.Frame list for the specified address.
+	// The result will typically have length 1, but may be longer if address corresponds
+	// to inlined calls.
+	makeFrames := func(addr uint64) []plugin.Frame {
+		loc := addrs[addr].loc
+		stack := make([]plugin.Frame, 0, len(loc.Line))
+		for _, line := range loc.Line {
+			fn := line.Function
+			if fn == nil {
+				continue
+			}
+			stack = append(stack, plugin.Frame{
+				Func: fn.Name,
+				File: fn.Filename,
+				Line: int(line.Line),
+			})
+		}
+		return stack
+	}
+
+	for _, addr := range unprocessed {
+		frames := makeFrames(addr)
+		x := instructionInfo{
+			objAddr: addr,
+			length:  1,
+			disasm:  synthAsm,
+		}
+		if len(frames) > 0 {
+			x.file = frames[0].File
+			x.line = frames[0].Line
+		}
+		sp.insts[addr] = x
+
+		sp.addStack(addr, frames)
+	}
+}
+
+// splitIntoRanges converts the set of addresses we are interested in into a set of address
+// ranges to disassemble. It also returns the set of addresses found that did not have an
+// associated object file and were therefore not added to an address range.
+func (sp *sourcePrinter) splitIntoRanges(prof *profile.Profile, addrMap map[uint64]addrInfo, flat map[uint64]int64) ([]addressRange, []uint64) {
+	// Partition addresses into two sets: ones with a known object file, and ones without.
+	var addrs, unprocessed []uint64
+	for addr, info := range addrMap {
+		if info.obj != nil {
+			addrs = append(addrs, addr)
+		} else {
+			unprocessed = append(unprocessed, addr)
+		}
 	}
 	sort.Slice(addrs, func(i, j int) bool { return addrs[i] < addrs[j] })
 
-	mappingIndex := 0
 	const expand = 500 // How much to expand range to pick up nearby addresses.
+	var result []addressRange
 	for i, n := 0, len(addrs); i < n; {
 		begin, end := addrs[i], addrs[i]
 		sum := flat[begin]
 		i++
 
-		// Advance to mapping containing addrs[i]
-		for mappingIndex < len(mappings) && mappings[mappingIndex].Limit <= begin {
-			mappingIndex++
-		}
-		if mappingIndex >= len(mappings) {
-			// TODO(sanjay): Report missed address and its samples.
-			break
-		}
-		m := mappings[mappingIndex]
-		obj := sp.objectFile(m)
-		if obj == nil {
-			// TODO(sanjay): Report missed address and its samples.
-			continue
-		}
+		info := addrMap[begin]
+		m := info.loc.Mapping
+		obj := info.obj // Non-nil because of the partitioning done above.
 
 		// Find following addresses that are close enough to addrs[i].
 		for i < n && addrs[i] <= end+2*expand && addrs[i] < m.Limit {
@@ -479,7 +587,7 @@ func (sp *sourcePrinter) splitIntoRanges(prof *profile.Profile, set map[uint64]b
 
 		result = append(result, addressRange{begin, end, obj, m, sum})
 	}
-	return result
+	return result, unprocessed
 }
 
 func (sp *sourcePrinter) initSamples(flat, cum map[uint64]int64) {
@@ -496,7 +604,7 @@ func (sp *sourcePrinter) initSamples(flat, cum map[uint64]int64) {
 	}
 }
 
-func (sp *sourcePrinter) print(w io.Writer, maxFiles int, rpt *Report) {
+func (sp *sourcePrinter) generate(maxFiles int, rpt *Report) WebListData {
 	// Finalize per-file counts.
 	for _, file := range sp.files {
 		seen := map[uint64]bool{}
@@ -528,19 +636,31 @@ func (sp *sourcePrinter) print(w io.Writer, maxFiles int, rpt *Report) {
 		maxFiles = len(files)
 	}
 	sort.Slice(files, order)
+	result := WebListData{
+		Total: rpt.formatValue(rpt.total),
+	}
 	for i, f := range files {
 		if i < maxFiles {
-			sp.printFile(w, f, rpt)
+			result.Files = append(result.Files, sp.generateFile(f, rpt))
 		}
 	}
+	return result
 }
 
-func (sp *sourcePrinter) printFile(w io.Writer, f *sourceFile, rpt *Report) {
+func (sp *sourcePrinter) generateFile(f *sourceFile, rpt *Report) WebListFile {
+	var result WebListFile
 	for _, fn := range sp.functions(f) {
 		if fn.cum == 0 {
 			continue
 		}
-		printFunctionHeader(w, fn.name, f.fname, fn.flat, fn.cum, rpt)
+
+		listfn := WebListFunc{
+			Name:       fn.name,
+			File:       f.fname,
+			Flat:       rpt.formatValue(fn.flat),
+			Cumulative: rpt.formatValue(fn.cum),
+			Percent:    measurement.Percentage(fn.cum, rpt.total),
+		}
 		var asm []assemblyInstruction
 		for l := fn.begin; l < fn.end; l++ {
 			lineContents, ok := sp.reader.line(f.fname, l)
@@ -584,10 +704,12 @@ func (sp *sourcePrinter) printFile(w io.Writer, f *sourceFile, rpt *Report) {
 				})
 			}
 
-			printFunctionSourceLine(w, l, flatSum, cumSum, lineContents, asm, sp.reader, rpt)
+			listfn.Lines = append(listfn.Lines, makeWebListLine(l, flatSum, cumSum, lineContents, asm, sp.reader, rpt))
 		}
-		printFunctionClosing(w)
+
+		result.Funcs = append(result.Funcs, listfn)
 	}
+	return result
 }
 
 // functions splits apart the lines to show in a file into a list of per-function ranges.
@@ -665,13 +787,16 @@ func (sp *sourcePrinter) functions(f *sourceFile) []sourceFunction {
 	return funcs
 }
 
-// objectFile return the object for the named file, opening it if necessary.
+// objectFile return the object for the specified mapping, opening it if necessary.
 // It returns nil on error.
 func (sp *sourcePrinter) objectFile(m *profile.Mapping) plugin.ObjFile {
+	if m == nil {
+		return nil
+	}
 	if object, ok := sp.objects[m.File]; ok {
 		return object // May be nil if we detected an error earlier.
 	}
-	object, err := sp.objectTool.Open(m.File, m.Start, m.Limit, m.Offset)
+	object, err := sp.objectTool.Open(m.File, m.Start, m.Limit, m.Offset, m.KernelRelocationSymbol)
 	if err != nil {
 		object = nil
 	}
@@ -679,73 +804,58 @@ func (sp *sourcePrinter) objectFile(m *profile.Mapping) plugin.ObjFile {
 	return object
 }
 
-// printHeader prints the page header for a weblist report.
-func printHeader(w io.Writer, rpt *Report) {
-	fmt.Fprintln(w, `
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Pprof listing</title>`)
-	fmt.Fprintln(w, weblistPageCSS)
-	fmt.Fprintln(w, weblistPageScript)
-	fmt.Fprint(w, "</head>\n<body>\n\n")
-
-	var labels []string
-	for _, l := range ProfileLabels(rpt) {
-		labels = append(labels, template.HTMLEscapeString(l))
+// makeWebListLine returns the contents of a single line in a web listing. This includes
+// the source line and the corresponding assembly.
+func makeWebListLine(lineNo int, flat, cum int64, lineContents string,
+	assembly []assemblyInstruction, reader *sourceReader, rpt *Report) WebListLine {
+	line := WebListLine{
+		SrcLine:    lineContents,
+		Line:       lineNo,
+		Flat:       valueOrDot(flat, rpt),
+		Cumulative: valueOrDot(cum, rpt),
 	}
 
-	fmt.Fprintf(w, `<div class="legend">%s<br>Total: %s</div>`,
-		strings.Join(labels, "<br>\n"),
-		rpt.formatValue(rpt.total),
-	)
-}
-
-// printFunctionHeader prints a function header for a weblist report.
-func printFunctionHeader(w io.Writer, name, path string, flatSum, cumSum int64, rpt *Report) {
-	fmt.Fprintf(w, `<h2>%s</h2><p class="filename">%s</p>
-<pre onClick="pprof_toggle_asm(event)">
-  Total:  %10s %10s (flat, cum) %s
-`,
-		template.HTMLEscapeString(name), template.HTMLEscapeString(path),
-		rpt.formatValue(flatSum), rpt.formatValue(cumSum),
-		measurement.Percentage(cumSum, rpt.total))
-}
-
-// printFunctionSourceLine prints a source line and the corresponding assembly.
-func printFunctionSourceLine(w io.Writer, lineNo int, flat, cum int64, lineContents string,
-	assembly []assemblyInstruction, reader *sourceReader, rpt *Report) {
 	if len(assembly) == 0 {
-		fmt.Fprintf(w,
-			"<span class=line> %6d</span> <span class=nop>  %10s %10s %8s  %s </span>\n",
-			lineNo,
-			valueOrDot(flat, rpt), valueOrDot(cum, rpt),
-			"", template.HTMLEscapeString(lineContents))
-		return
+		line.HTMLClass = "nop"
+		return line
 	}
 
-	fmt.Fprintf(w,
-		"<span class=line> %6d</span> <span class=deadsrc>  %10s %10s %8s  %s </span>",
-		lineNo,
-		valueOrDot(flat, rpt), valueOrDot(cum, rpt),
-		"", template.HTMLEscapeString(lineContents))
-	srcIndent := indentation(lineContents)
-	fmt.Fprint(w, "<span class=asm>")
+	nestedInfo := false
+	line.HTMLClass = "deadsrc"
+	for _, an := range assembly {
+		if len(an.inlineCalls) > 0 || an.instruction != synthAsm {
+			nestedInfo = true
+			line.HTMLClass = "livesrc"
+		}
+	}
+
+	if nestedInfo {
+		srcIndent := indentation(lineContents)
+		line.Instructions = makeWebListInstructions(srcIndent, assembly, reader, rpt)
+	}
+	return line
+}
+
+func makeWebListInstructions(srcIndent int, assembly []assemblyInstruction, reader *sourceReader, rpt *Report) []WebListInstruction {
+	var result []WebListInstruction
 	var curCalls []callID
 	for i, an := range assembly {
-		if an.startsBlock && i != 0 {
-			// Insert a separator between discontiguous blocks.
-			fmt.Fprintf(w, " %8s %28s\n", "", "⋮")
-		}
-
 		var fileline string
 		if an.file != "" {
 			fileline = fmt.Sprintf("%s:%d", template.HTMLEscapeString(filepath.Base(an.file)), an.line)
 		}
-		flat, cum := an.flat, an.cum
+		text := strings.Repeat(" ", srcIndent+4+4*len(an.inlineCalls)) + an.instruction
+		inst := WebListInstruction{
+			NewBlock:   (an.startsBlock && i != 0),
+			Flat:       valueOrDot(an.flat, rpt),
+			Cumulative: valueOrDot(an.cum, rpt),
+			Synthetic:  (an.instruction == synthAsm),
+			Address:    an.address,
+			Disasm:     rightPad(text, 80),
+			FileLine:   fileline,
+		}
 
-		// Print inlined call context.
+		// Add inlined call context.
 		for j, c := range an.inlineCalls {
 			if j < len(curCalls) && curCalls[j] == c {
 				// Skip if same as previous instruction.
@@ -756,33 +866,18 @@ func printFunctionSourceLine(w io.Writer, lineNo int, flat, cum int64, lineConte
 			if !ok {
 				fline = ""
 			}
-			text := strings.Repeat(" ", srcIndent+4+4*j) + strings.TrimSpace(fline)
-			fmt.Fprintf(w, " %8s %10s %10s %8s  <span class=inlinesrc>%s</span> <span class=unimportant>%s:%d</span>\n",
-				"", "", "", "",
-				template.HTMLEscapeString(rightPad(text, 80)),
-				template.HTMLEscapeString(filepath.Base(c.file)), c.line)
+			srcCode := strings.Repeat(" ", srcIndent+4+4*j) + strings.TrimSpace(fline)
+			inst.InlinedCalls = append(inst.InlinedCalls, WebListCall{
+				SrcLine:  rightPad(srcCode, 80),
+				FileBase: filepath.Base(c.file),
+				Line:     c.line,
+			})
 		}
 		curCalls = an.inlineCalls
-		text := strings.Repeat(" ", srcIndent+4+4*len(curCalls)) + an.instruction
-		fmt.Fprintf(w, " %8s %10s %10s %8x: %s <span class=unimportant>%s</span>\n",
-			"", valueOrDot(flat, rpt), valueOrDot(cum, rpt), an.address,
-			template.HTMLEscapeString(rightPad(text, 80)),
-			// fileline should not be escaped since it was formed by appending
-			// line number (just digits) to an escaped file name. Escaping here
-			// would cause double-escaping of file name.
-			fileline)
+
+		result = append(result, inst)
 	}
-	fmt.Fprintln(w, "</span>")
-}
-
-// printFunctionClosing prints the end of a function in a weblist report.
-func printFunctionClosing(w io.Writer) {
-	fmt.Fprintln(w, "</pre>")
-}
-
-// printPageClosing prints the end of the page in a weblist report.
-func printPageClosing(w io.Writer) {
-	fmt.Fprintln(w, weblistPageClosing)
+	return result
 }
 
 // getSourceFromFile collects the sources of a function from a source

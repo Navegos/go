@@ -22,19 +22,19 @@ func leaktoret(p *int) *int { // ERROR "leaking param: p to result"
 	return p
 }
 
-func leaktoret2(p *int) (*int, *int) { // ERROR "leaking param: p to result ~r1" "leaking param: p to result ~r2"
+func leaktoret2(p *int) (*int, *int) { // ERROR "leaking param: p to result ~r0" "leaking param: p to result ~r1"
 	return p, p
 }
 
-func leaktoret22(p, q *int) (*int, *int) { // ERROR "leaking param: p to result ~r2" "leaking param: q to result ~r3"
+func leaktoret22(p, q *int) (*int, *int) { // ERROR "leaking param: p to result ~r0" "leaking param: q to result ~r1"
 	return p, q
 }
 
-func leaktoret22b(p, q *int) (*int, *int) { // ERROR "leaking param: p to result ~r3" "leaking param: q to result ~r2"
+func leaktoret22b(p, q *int) (*int, *int) { // ERROR "leaking param: p to result ~r1" "leaking param: q to result ~r0"
 	return leaktoret22(q, p)
 }
 
-func leaktoret22c(p, q *int) (*int, *int) { // ERROR "leaking param: p to result ~r3" "leaking param: q to result ~r2"
+func leaktoret22c(p, q *int) (*int, *int) { // ERROR "leaking param: p to result ~r1" "leaking param: q to result ~r0"
 	r, s := leaktoret22(q, p)
 	return r, s
 }
@@ -151,7 +151,7 @@ func f9() {
 func f10() {
 	// These don't escape but are too big for the stack
 	var x [1 << 30]byte         // ERROR "moved to heap: x"
-	var y = make([]byte, 1<<30) // ERROR "make\(\[\]byte, 1 << 30\) escapes to heap"
+	var y = make([]byte, 1<<30) // ERROR "make\(\[\]byte, 1073741824\) escapes to heap"
 	_ = x[0] + y[0]
 }
 
@@ -173,15 +173,14 @@ type U int
 func (*U) M()   {}
 func (_ *U) N() {}
 
-func _() {
+func fbad24305a() {
 	var u U
 	u.M()
 	u.N()
 }
 
-func fbad24305() {
-	// BAD u should not be heap allocated
-	var u U // ERROR "moved to heap: u"
+func fbad24305b() {
+	var u U
 	(*U).M(&u)
 	(*U).N(&u)
 }

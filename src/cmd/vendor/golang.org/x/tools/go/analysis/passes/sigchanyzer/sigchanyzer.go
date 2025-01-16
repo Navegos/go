@@ -8,6 +8,7 @@ package sigchanyzer
 
 import (
 	"bytes"
+	_ "embed"
 	"go/ast"
 	"go/format"
 	"go/token"
@@ -15,23 +16,27 @@ import (
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
+	"golang.org/x/tools/go/analysis/passes/internal/analysisutil"
 	"golang.org/x/tools/go/ast/inspector"
 )
 
-const Doc = `check for unbuffered channel of os.Signal
-
-This checker reports call expression of the form signal.Notify(c <-chan os.Signal, sig ...os.Signal),
-where c is an unbuffered channel, which can be at risk of missing the signal.`
+//go:embed doc.go
+var doc string
 
 // Analyzer describes sigchanyzer analysis function detector.
 var Analyzer = &analysis.Analyzer{
 	Name:     "sigchanyzer",
-	Doc:      Doc,
+	Doc:      analysisutil.MustExtractDoc(doc, "sigchanyzer"),
+	URL:      "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/sigchanyzer",
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
+	if !analysisutil.Imports(pass.Pkg, "os/signal") {
+		return nil, nil // doesn't directly import signal
+	}
+
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	nodeFilter := []ast.Node{
@@ -50,7 +55,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			}
 		case *ast.CallExpr:
 			// Only signal.Notify(make(chan os.Signal), os.Interrupt) is safe,
-			// conservatively treate others as not safe, see golang/go#45043
+			// conservatively treat others as not safe, see golang/go#45043
 			if isBuiltinMake(pass.TypesInfo, arg) {
 				return
 			}
@@ -59,12 +64,19 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		if chanDecl == nil || len(chanDecl.Args) != 1 {
 			return
 		}
-		chanDecl.Args = append(chanDecl.Args, &ast.BasicLit{
+
+		// Make a copy of the channel's declaration to avoid
+		// mutating the AST. See https://golang.org/issue/46129.
+		chanDeclCopy := &ast.CallExpr{}
+		*chanDeclCopy = *chanDecl
+		chanDeclCopy.Args = append([]ast.Expr(nil), chanDecl.Args...)
+		chanDeclCopy.Args = append(chanDeclCopy.Args, &ast.BasicLit{
 			Kind:  token.INT,
 			Value: "1",
 		})
+
 		var buf bytes.Buffer
-		if err := format.Node(&buf, token.NewFileSet(), chanDecl); err != nil {
+		if err := format.Node(&buf, token.NewFileSet(), chanDeclCopy); err != nil {
 			return
 		}
 		pass.Report(analysis.Diagnostic{

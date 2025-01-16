@@ -6,7 +6,10 @@ package work
 
 import (
 	"os"
+	"strings"
 	"testing"
+
+	"cmd/go/internal/cfg"
 )
 
 var goodCompilerFlags = [][]string{
@@ -15,6 +18,7 @@ var goodCompilerFlags = [][]string{
 	{"-Ufoo"},
 	{"-Ufoo1"},
 	{"-F/Qt"},
+	{"-F", "/Qt"},
 	{"-I/"},
 	{"-I/etc/passwd"},
 	{"-I."},
@@ -27,6 +31,7 @@ var goodCompilerFlags = [][]string{
 	{"-Wp,-Ufoo"},
 	{"-Wp,-Dfoo1"},
 	{"-Wp,-Ufoo1"},
+	{"-flto"},
 	{"-fobjc-arc"},
 	{"-fno-objc-arc"},
 	{"-fomit-frame-pointer"},
@@ -44,11 +49,14 @@ var goodCompilerFlags = [][]string{
 	{"-fstack-xxx"},
 	{"-fno-stack-xxx"},
 	{"-fsanitize=hands"},
+	{"-ftls-model=local-dynamic"},
 	{"-g"},
 	{"-ggdb"},
 	{"-march=souza"},
+	{"-mcmodel=medium"},
 	{"-mcpu=123"},
 	{"-mfpu=123"},
+	{"-mlarge-data-threshold=16"},
 	{"-mtune=happybirthday"},
 	{"-mstack-overflow"},
 	{"-mno-stack-overflow"},
@@ -89,6 +97,8 @@ var badCompilerFlags = [][]string{
 	{"-g-gdb"},
 	{"-march=@dawn"},
 	{"-march=-dawn"},
+	{"-mcmodel=@model"},
+	{"-mlarge-data-threshold=@12"},
 	{"-std=@c99"},
 	{"-std=-c99"},
 	{"-x@c"},
@@ -164,6 +174,23 @@ var goodLinkerFlags = [][]string{
 	{"-Wl,-framework", "-Wl,Chocolate"},
 	{"-Wl,-framework,Chocolate"},
 	{"-Wl,-unresolved-symbols=ignore-all"},
+	{"-Wl,-z,relro"},
+	{"-Wl,-z,relro,-z,now"},
+	{"-Wl,-z,now"},
+	{"-Wl,-z,noexecstack"},
+	{"libcgotbdtest.tbd"},
+	{"./libcgotbdtest.tbd"},
+	{"-Wl,--push-state"},
+	{"-Wl,--pop-state"},
+	{"-Wl,--push-state,--as-needed"},
+	{"-Wl,--push-state,--no-as-needed,-Bstatic"},
+	{"-Wl,--just-symbols,."},
+	{"-Wl,-framework,."},
+	{"-Wl,-rpath,."},
+	{"-Wl,-rpath-link,."},
+	{"-Wl,-sectcreate,.,.,."},
+	{"-Wl,-syslibroot,."},
+	{"-Wl,-undefined,."},
 }
 
 var badLinkerFlags = [][]string{
@@ -220,11 +247,37 @@ var badLinkerFlags = [][]string{
 	{"-Wl,--hash-style=foo"},
 	{"-x", "--c"},
 	{"-x", "@obj"},
+	{"-Wl,-dylib_install_name,@foo"},
+	{"-Wl,-install_name,@foo"},
 	{"-Wl,-rpath,@foo"},
 	{"-Wl,-R,foo,bar"},
 	{"-Wl,-R,@foo"},
 	{"-Wl,--just-symbols,@foo"},
 	{"../x.o"},
+	{"-Wl,-R,"},
+	{"-Wl,-O"},
+	{"-Wl,-e="},
+	{"-Wl,-e,"},
+	{"-Wl,-R,-flag"},
+	{"-Wl,--push-state,"},
+	{"-Wl,--push-state,@foo"},
+	{"-fplugin=./-Wl,--push-state,-R.so"},
+	{"./-Wl,--push-state,-R.c"},
+}
+
+var goodLinkerFlagsOnDarwin = [][]string{
+	{"-Wl,-dylib_install_name,@rpath"},
+	{"-Wl,-dylib_install_name,@rpath/"},
+	{"-Wl,-dylib_install_name,@rpath/foo"},
+	{"-Wl,-install_name,@rpath"},
+	{"-Wl,-install_name,@rpath/"},
+	{"-Wl,-install_name,@rpath/foo"},
+	{"-Wl,-rpath,@executable_path"},
+	{"-Wl,-rpath,@executable_path/"},
+	{"-Wl,-rpath,@executable_path/foo"},
+	{"-Wl,-rpath,@loader_path"},
+	{"-Wl,-rpath,@loader_path/"},
+	{"-Wl,-rpath,@loader_path/foo"},
 }
 
 func TestCheckLinkerFlags(t *testing.T) {
@@ -238,6 +291,31 @@ func TestCheckLinkerFlags(t *testing.T) {
 			t.Errorf("missing error for %q", f)
 		}
 	}
+
+	goos := cfg.Goos
+
+	cfg.Goos = "darwin"
+	for _, f := range goodLinkerFlagsOnDarwin {
+		if err := checkLinkerFlags("test", "test", f); err != nil {
+			t.Errorf("unexpected error for %q: %v", f, err)
+		}
+	}
+
+	cfg.Goos = "ios"
+	for _, f := range goodLinkerFlagsOnDarwin {
+		if err := checkLinkerFlags("test", "test", f); err != nil {
+			t.Errorf("unexpected error for %q: %v", f, err)
+		}
+	}
+
+	cfg.Goos = "linux"
+	for _, f := range goodLinkerFlagsOnDarwin {
+		if err := checkLinkerFlags("test", "test", f); err == nil {
+			t.Errorf("missing error for %q", f)
+		}
+	}
+
+	cfg.Goos = goos
 }
 
 func TestCheckFlagAllowDisallow(t *testing.T) {
@@ -273,5 +351,36 @@ func TestCheckFlagAllowDisallow(t *testing.T) {
 	}
 	if err := checkCompilerFlags("TEST", "test", []string{"-fplugin=lint.so"}); err == nil {
 		t.Fatalf("missing error for -fplugin=lint.so: %v", err)
+	}
+}
+
+func TestCheckCompilerFlagsForInternalLink(t *testing.T) {
+	// Any "bad" compiler flag should trigger external linking.
+	for _, f := range badCompilerFlags {
+		if err := checkCompilerFlagsForInternalLink("test", "test", f); err == nil {
+			t.Errorf("missing error for %q", f)
+		}
+	}
+
+	// All "good" compiler flags should not trigger external linking,
+	// except for anything that begins with "-flto".
+	for _, f := range goodCompilerFlags {
+		foundLTO := false
+		for _, s := range f {
+			if strings.Contains(s, "-flto") {
+				foundLTO = true
+			}
+		}
+		if err := checkCompilerFlagsForInternalLink("test", "test", f); err != nil {
+			// expect error for -flto
+			if !foundLTO {
+				t.Errorf("unexpected error for %q: %v", f, err)
+			}
+		} else {
+			// expect no error for everything else
+			if foundLTO {
+				t.Errorf("missing error for %q: %v", f, err)
+			}
+		}
 	}
 }

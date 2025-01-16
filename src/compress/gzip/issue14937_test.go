@@ -1,3 +1,7 @@
+// Copyright 2016 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gzip
 
 import (
@@ -14,6 +18,10 @@ import (
 // has a zero MTIME. This is a requirement for the Debian maintainers
 // to be able to have deterministic packages.
 //
+// To patch a .gz file, use the following command:
+//
+//	$ dd if=/dev/zero bs=1 seek=4 count=4 conv=notrunc of=filename.gz
+//
 // See https://golang.org/issue/14937.
 func TestGZIPFilesHaveZeroMTimes(t *testing.T) {
 	// To avoid spurious false positives due to untracked GZIP files that
@@ -22,9 +30,7 @@ func TestGZIPFilesHaveZeroMTimes(t *testing.T) {
 	if testenv.Builder() == "" {
 		t.Skip("skipping test on non-builder")
 	}
-	if !testenv.HasSrc() {
-		t.Skip("skipping; no GOROOT available")
-	}
+	testenv.MustHaveSource(t)
 
 	goroot, err := filepath.EvalSymlinks(runtime.GOROOT())
 	if err != nil {

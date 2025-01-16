@@ -7,7 +7,8 @@ package mime
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -19,13 +20,12 @@ import (
 // FormatMediaType returns the empty string.
 func FormatMediaType(t string, param map[string]string) string {
 	var b strings.Builder
-	if slash := strings.IndexByte(t, '/'); slash == -1 {
+	if major, sub, ok := strings.Cut(t, "/"); !ok {
 		if !isToken(t) {
 			return ""
 		}
 		b.WriteString(strings.ToLower(t))
 	} else {
-		major, sub := t[:slash], t[slash+1:]
 		if !isToken(major) || !isToken(sub) {
 			return ""
 		}
@@ -34,13 +34,7 @@ func FormatMediaType(t string, param map[string]string) string {
 		b.WriteString(strings.ToLower(sub))
 	}
 
-	attrs := make([]string, 0, len(param))
-	for a := range param {
-		attrs = append(attrs, a)
-	}
-	sort.Strings(attrs)
-
-	for _, attribute := range attrs {
+	for _, attribute := range slices.Sorted(maps.Keys(param)) {
 		value := param[attribute]
 		b.WriteByte(';')
 		b.WriteByte(' ')
@@ -122,7 +116,7 @@ func checkMediaTypeDisposition(s string) error {
 	return nil
 }
 
-// ErrInvalidMediaParameter is returned by ParseMediaType if
+// ErrInvalidMediaParameter is returned by [ParseMediaType] if
 // the media type value was found but there was an error parsing
 // the optional parameters
 var ErrInvalidMediaParameter = errors.New("mime: invalid media parameter")
@@ -134,15 +128,12 @@ var ErrInvalidMediaParameter = errors.New("mime: invalid media parameter")
 // to lowercase and trimmed of white space and a non-nil map.
 // If there is an error parsing the optional parameter,
 // the media type will be returned along with the error
-// ErrInvalidMediaParameter.
+// [ErrInvalidMediaParameter].
 // The returned map, params, maps from the lowercase
 // attribute to the attribute value with its case preserved.
 func ParseMediaType(v string) (mediatype string, params map[string]string, err error) {
-	i := strings.Index(v, ";")
-	if i == -1 {
-		i = len(v)
-	}
-	mediatype = strings.TrimSpace(strings.ToLower(v[0:i]))
+	base, _, _ := strings.Cut(v, ";")
+	mediatype = strings.TrimSpace(strings.ToLower(base))
 
 	err = checkMediaTypeDisposition(mediatype)
 	if err != nil {
@@ -156,7 +147,7 @@ func ParseMediaType(v string) (mediatype string, params map[string]string, err e
 	// Lazily initialized.
 	var continuation map[string]map[string]string
 
-	v = v[i:]
+	v = v[len(base):]
 	for len(v) > 0 {
 		v = strings.TrimLeftFunc(v, unicode.IsSpace)
 		if len(v) == 0 {
@@ -167,15 +158,14 @@ func ParseMediaType(v string) (mediatype string, params map[string]string, err e
 			if strings.TrimSpace(rest) == ";" {
 				// Ignore trailing semicolons.
 				// Not an error.
-				return
+				break
 			}
 			// Parse error.
 			return mediatype, nil, ErrInvalidMediaParameter
 		}
 
 		pmap := params
-		if idx := strings.Index(key, "*"); idx != -1 {
-			baseName := key[:idx]
+		if baseName, _, ok := strings.Cut(key, "*"); ok {
 			if continuation == nil {
 				continuation = make(map[string]map[string]string)
 			}
@@ -185,8 +175,8 @@ func ParseMediaType(v string) (mediatype string, params map[string]string, err e
 				pmap = continuation[baseName]
 			}
 		}
-		if _, exists := pmap[key]; exists {
-			// Duplicate parameter name is bogus.
+		if v, exists := pmap[key]; exists && v != value {
+			// Duplicate parameter names are incorrect, but we allow them if they are equal.
 			return "", nil, errors.New("mime: duplicate parameter name")
 		}
 		pmap[key] = value

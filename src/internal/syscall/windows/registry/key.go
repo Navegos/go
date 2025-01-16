@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build windows
+//go:build windows
 
 // Package registry provides access to the Windows registry.
 //
@@ -22,14 +22,16 @@
 //
 // NOTE: This package is a copy of golang.org/x/sys/windows/registry
 // with KeyInfo.ModTime removed to prevent dependency cycles.
-//
 package registry
 
-import "syscall"
+import (
+	"runtime"
+	"syscall"
+)
 
 const (
 	// Registry key security and access rights.
-	// See https://msdn.microsoft.com/en-us/library/windows/desktop/ms724878.aspx
+	// See https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry-key-security-and-access-rights
 	// for details.
 	ALL_ACCESS         = 0xf003f
 	CREATE_LINK        = 0x00020
@@ -88,9 +90,15 @@ func OpenKey(k Key, path string, access uint32) (Key, error) {
 
 // ReadSubKeyNames returns the names of subkeys of key k.
 func (k Key) ReadSubKeyNames() ([]string, error) {
+	// RegEnumKeyEx must be called repeatedly and to completion.
+	// During this time, this goroutine cannot migrate away from
+	// its current thread. See #49320.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	names := make([]string, 0)
 	// Registry key size limit is 255 bytes and described there:
-	// https://msdn.microsoft.com/library/windows/desktop/ms724872.aspx
+	// https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry-element-size-limits
 	buf := make([]uint16, 256) //plus extra room for terminating zero byte
 loopItems:
 	for i := uint32(0); ; i++ {

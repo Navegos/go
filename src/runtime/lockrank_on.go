@@ -3,18 +3,19 @@
 // license that can be found in the LICENSE file.
 
 //go:build goexperiment.staticlockranking
-// +build goexperiment.staticlockranking
 
 package runtime
 
 import (
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
+const staticLockRanking = true
+
 // worldIsStopped is accessed atomically to track world-stops. 1 == world
 // stopped.
-var worldIsStopped uint32
+var worldIsStopped atomic.Uint32
 
 // lockRankStruct is embedded in mutex
 type lockRankStruct struct {
@@ -25,6 +26,9 @@ type lockRankStruct struct {
 	pad int
 }
 
+// lockInit(l *mutex, rank int) sets the rank of lock before it is used.
+// If there is no clear place to initialize a lock, then the rank of a lock can be
+// specified during the lock call itself via lockWithRank(l *mutex, rank int).
 func lockInit(l *mutex, rank lockRank) {
 	l.rank = rank
 }
@@ -47,7 +51,7 @@ func getLockRank(l *mutex) lockRank {
 // split on entry to lock2() would record stack split locks as taken after l,
 // even though l is not actually locked yet.
 func lockWithRank(l *mutex, rank lockRank) {
-	if l == &debuglock || l == &paniclk {
+	if l == &debuglock || l == &paniclk || l == &raceFiniLock {
 		// debuglock is only used for println/printlock(). Don't do lock
 		// rank recording for it, since print/println are used when
 		// printing out a lock ordering problem below.
@@ -57,6 +61,10 @@ func lockWithRank(l *mutex, rank lockRank) {
 		// lock ordering problem. Additionally, paniclk may be taken
 		// after effectively any lock (anywhere we might panic), which
 		// the partial order doesn't cover.
+		//
+		// raceFiniLock is held while exiting when running
+		// the race detector. Don't do lock rank recording for it,
+		// since we are exiting.
 		lock2(l)
 		return
 	}
@@ -83,6 +91,7 @@ func lockWithRank(l *mutex, rank lockRank) {
 }
 
 // nosplit to ensure it can be called in as many contexts as possible.
+//
 //go:nosplit
 func printHeldLocks(gp *g) {
 	if gp.m.locksHeldLen == 0 {
@@ -95,11 +104,16 @@ func printHeldLocks(gp *g) {
 	}
 }
 
-// acquireLockRank acquires a rank which is not associated with a mutex lock
+// acquireLockRankAndM acquires a rank which is not associated with a mutex
+// lock. To maintain the invariant that an M with m.locks==0 does not hold any
+// lock-like resources, it also acquires the M.
 //
 // This function may be called in nosplit context and thus must be nosplit.
+//
 //go:nosplit
-func acquireLockRank(rank lockRank) {
+func acquireLockRankAndM(rank lockRank) {
+	acquirem()
+
 	gp := getg()
 	// Log the new class. See comment on lockWithRank.
 	systemstack(func() {
@@ -155,7 +169,7 @@ func checkRanks(gp *g, prevRank, rank lockRank) {
 
 // See comment on lockWithRank regarding stack splitting.
 func unlockWithRank(l *mutex) {
-	if l == &debuglock || l == &paniclk {
+	if l == &debuglock || l == &paniclk || l == &raceFiniLock {
 		// See comment at beginning of lockWithRank.
 		unlock2(l)
 		return
@@ -179,11 +193,14 @@ func unlockWithRank(l *mutex) {
 	})
 }
 
-// releaseLockRank releases a rank which is not associated with a mutex lock
+// releaseLockRankAndM releases a rank which is not associated with a mutex
+// lock. To maintain the invariant that an M with m.locks==0 does not hold any
+// lock-like resources, it also releases the M.
 //
 // This function may be called in nosplit context and thus must be nosplit.
+//
 //go:nosplit
-func releaseLockRank(rank lockRank) {
+func releaseLockRankAndM(rank lockRank) {
 	gp := getg()
 	systemstack(func() {
 		found := false
@@ -200,9 +217,13 @@ func releaseLockRank(rank lockRank) {
 			throw("lockRank release without matching lockRank acquire")
 		}
 	})
+
+	releasem(getg().m)
 }
 
-// See comment on lockWithRank regarding stack splitting.
+// nosplit because it may be called from nosplit contexts.
+//
+//go:nosplit
 func lockWithRankMayAcquire(l *mutex, rank lockRank) {
 	gp := getg()
 	if gp.m.locksHeldLen == 0 {
@@ -227,6 +248,7 @@ func lockWithRankMayAcquire(l *mutex, rank lockRank) {
 }
 
 // nosplit to ensure it can be called in as many contexts as possible.
+//
 //go:nosplit
 func checkLockHeld(gp *g, l *mutex) bool {
 	for i := gp.m.locksHeldLen - 1; i >= 0; i-- {
@@ -240,6 +262,7 @@ func checkLockHeld(gp *g, l *mutex) bool {
 // assertLockHeld throws if l is not held by the caller.
 //
 // nosplit to ensure it can be called in as many contexts as possible.
+//
 //go:nosplit
 func assertLockHeld(l *mutex) {
 	gp := getg()
@@ -265,6 +288,7 @@ func assertLockHeld(l *mutex) {
 // pointer to the exact mutex is not available.
 //
 // nosplit to ensure it can be called in as many contexts as possible.
+//
 //go:nosplit
 func assertRankHeld(r lockRank) {
 	gp := getg()
@@ -290,9 +314,10 @@ func assertRankHeld(r lockRank) {
 // Caller must hold worldsema.
 //
 // nosplit to ensure it can be called in as many contexts as possible.
+//
 //go:nosplit
 func worldStopped() {
-	if stopped := atomic.Xadd(&worldIsStopped, 1); stopped != 1 {
+	if stopped := worldIsStopped.Add(1); stopped != 1 {
 		systemstack(func() {
 			print("world stop count=", stopped, "\n")
 			throw("recursive world stop")
@@ -305,9 +330,10 @@ func worldStopped() {
 // Caller must hold worldsema.
 //
 // nosplit to ensure it can be called in as many contexts as possible.
+//
 //go:nosplit
 func worldStarted() {
-	if stopped := atomic.Xadd(&worldIsStopped, -1); stopped != 0 {
+	if stopped := worldIsStopped.Add(-1); stopped != 0 {
 		systemstack(func() {
 			print("world stop count=", stopped, "\n")
 			throw("released non-stopped world stop")
@@ -316,9 +342,10 @@ func worldStarted() {
 }
 
 // nosplit to ensure it can be called in as many contexts as possible.
+//
 //go:nosplit
 func checkWorldStopped() bool {
-	stopped := atomic.Load(&worldIsStopped)
+	stopped := worldIsStopped.Load()
 	if stopped > 1 {
 		systemstack(func() {
 			print("inconsistent world stop count=", stopped, "\n")
@@ -333,6 +360,7 @@ func checkWorldStopped() bool {
 // which M stopped the world.
 //
 // nosplit to ensure it can be called in as many contexts as possible.
+//
 //go:nosplit
 func assertWorldStopped() {
 	if checkWorldStopped() {
@@ -346,6 +374,7 @@ func assertWorldStopped() {
 // passed lock is not held.
 //
 // nosplit to ensure it can be called in as many contexts as possible.
+//
 //go:nosplit
 func assertWorldStoppedOrLockHeld(l *mutex) {
 	if checkWorldStopped() {

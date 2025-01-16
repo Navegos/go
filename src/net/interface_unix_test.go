@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd
-// +build darwin dragonfly freebsd linux netbsd openbsd
 
 package net
 
@@ -194,6 +193,9 @@ func TestInterfaceArrivalAndDepartureZoneCache(t *testing.T) {
 		t.Skipf("test requires external command: %v", err)
 	}
 	if err := ti.setup(); err != nil {
+		if e := err.Error(); strings.Contains(e, "Permission denied") {
+			t.Skipf("permission denied, skipping test: %v", e)
+		}
 		t.Fatal(err)
 	}
 	defer ti.teardown()

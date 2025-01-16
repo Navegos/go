@@ -24,7 +24,6 @@ type Start struct {
 
 func (start *Start) Next() *Inst { return nil }
 
-
 func AddInst(Inst) *Inst {
 	print("ok in addinst\n")
 	return nil
@@ -32,9 +31,7 @@ func AddInst(Inst) *Inst {
 
 func main() {
 	print("call addinst\n")
-	var x Inst = AddInst(new(Start)) // ERROR "pointer to interface|incompatible type"
-	_ = x
+	var _ Inst = AddInst(new(Start)) // ERROR "pointer to interface|incompatible type"
 	print("return from  addinst\n")
-	var y *Inst = new(Start)  // ERROR "pointer to interface|incompatible type"
-	_ = y
+	var _ *Inst = new(Start) // ERROR "pointer to interface|incompatible type"
 }

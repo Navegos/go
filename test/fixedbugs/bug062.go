@@ -7,6 +7,5 @@
 package main
 
 func main() {
-	var s string = nil;	// ERROR "illegal|invalid|incompatible|cannot"
-	_ = s
+	var _ string = nil // ERROR "illegal|invalid|incompatible|cannot"
 }

@@ -7,8 +7,10 @@
 package runtime
 
 import (
-	"runtime/internal/atomic"
-	"runtime/internal/sys"
+	"internal/abi"
+	"internal/goarch"
+	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -70,9 +72,7 @@ func gcMarkRootPrepare() {
 		if nDataRoots > work.nDataRoots {
 			work.nDataRoots = nDataRoots
 		}
-	}
 
-	for _, datap := range activeModules() {
 		nBSSRoots := nBlocks(datap.ebss - datap.bss)
 		if nBSSRoots > work.nBSSRoots {
 			work.nBSSRoots = nBSSRoots
@@ -100,7 +100,8 @@ func gcMarkRootPrepare() {
 	// ignore them because they begin life without any roots, so
 	// there's nothing to scan, and any roots they create during
 	// the concurrent phase will be caught by the write barrier.
-	work.nStackRoots = int(atomic.Loaduintptr(&allglen))
+	work.stackRoots = allGsSnapshot()
+	work.nStackRoots = len(work.stackRoots)
 
 	work.markrootNext = 0
 	work.markrootJobs = uint32(fixedRootCount + work.nDataRoots + work.nBSSRoots + work.nSpanRoots + work.nStackRoots)
@@ -150,25 +151,35 @@ var oneptrmask = [...]uint8{1}
 //
 // Preemption must be disabled (because this uses a gcWork).
 //
+// Returns the amount of GC work credit produced by the operation.
+// If flushBgCredit is true, then that credit is also flushed
+// to the background credit pool.
+//
 // nowritebarrier is only advisory here.
 //
 //go:nowritebarrier
-func markroot(gcw *gcWork, i uint32) {
+func markroot(gcw *gcWork, i uint32, flushBgCredit bool) int64 {
 	// Note: if you add a case here, please also update heapdump.go:dumproots.
+	var workDone int64
+	var workCounter *atomic.Int64
 	switch {
 	case work.baseData <= i && i < work.baseBSS:
+		workCounter = &gcController.globalsScanWork
 		for _, datap := range activeModules() {
-			markrootBlock(datap.data, datap.edata-datap.data, datap.gcdatamask.bytedata, gcw, int(i-work.baseData))
+			workDone += markrootBlock(datap.data, datap.edata-datap.data, datap.gcdatamask.bytedata, gcw, int(i-work.baseData))
 		}
 
 	case work.baseBSS <= i && i < work.baseSpans:
+		workCounter = &gcController.globalsScanWork
 		for _, datap := range activeModules() {
-			markrootBlock(datap.bss, datap.ebss-datap.bss, datap.gcbssmask.bytedata, gcw, int(i-work.baseBSS))
+			workDone += markrootBlock(datap.bss, datap.ebss-datap.bss, datap.gcbssmask.bytedata, gcw, int(i-work.baseBSS))
 		}
 
 	case i == fixedRootFinalizers:
 		for fb := allfin; fb != nil; fb = fb.alllink {
 			cnt := uintptr(atomic.Load(&fb.cnt))
+			// Finalizers that contain cleanups only have fn set. None of the other
+			// fields are necessary.
 			scanblock(uintptr(unsafe.Pointer(&fb.fin[0])), cnt*unsafe.Sizeof(fb.fin[0]), &finptrmask[0], gcw, nil)
 		}
 
@@ -183,15 +194,13 @@ func markroot(gcw *gcWork, i uint32) {
 
 	default:
 		// the rest is scanning goroutine stacks
-		var gp *g
-		if work.baseStacks <= i && i < work.baseEnd {
-			// N.B. Atomic read of allglen in gcMarkRootPrepare
-			// acts as a barrier to ensure that allgs must be large
-			// enough to contain all relevant Gs.
-			gp = allgs[i-work.baseStacks]
-		} else {
+		workCounter = &gcController.stackScanWork
+		if i < work.baseStacks || work.baseEnd <= i {
+			printlock()
+			print("runtime: markroot index ", i, " not in stack roots range [", work.baseStacks, ", ", work.baseEnd, ")\n")
 			throw("markroot: bad index")
 		}
+		gp := work.stackRoots[i-work.baseStacks]
 
 		// remember when we've first observed the G blocked
 		// needed only to output in traceback
@@ -210,8 +219,7 @@ func markroot(gcw *gcWork, i uint32) {
 			userG := getg().m.curg
 			selfScan := gp == userG && readgstatus(userG) == _Grunning
 			if selfScan {
-				casgstatus(userG, _Grunning, _Gwaiting)
-				userG.waitreason = waitReasonGarbageCollectionScan
+				casGToWaitingForGC(userG, _Grunning, waitReasonGarbageCollectionScan)
 			}
 
 			// TODO: suspendG blocks (and spins) until gp
@@ -229,7 +237,7 @@ func markroot(gcw *gcWork, i uint32) {
 			if gp.gcscandone {
 				throw("g already scanned")
 			}
-			scanstack(gp, gcw)
+			workDone += scanstack(gp, gcw)
 			gp.gcscandone = true
 			resumeG(stopped)
 
@@ -238,14 +246,23 @@ func markroot(gcw *gcWork, i uint32) {
 			}
 		})
 	}
+	if workCounter != nil && workDone != 0 {
+		workCounter.Add(workDone)
+		if flushBgCredit {
+			gcFlushBgCredit(workDone)
+		}
+	}
+	return workDone
 }
 
 // markrootBlock scans the shard'th shard of the block of memory [b0,
 // b0+n0), with the given pointer mask.
 //
+// Returns the amount of work done.
+//
 //go:nowritebarrier
-func markrootBlock(b0, n0 uintptr, ptrmask0 *uint8, gcw *gcWork, shard int) {
-	if rootBlockBytes%(8*sys.PtrSize) != 0 {
+func markrootBlock(b0, n0 uintptr, ptrmask0 *uint8, gcw *gcWork, shard int) int64 {
+	if rootBlockBytes%(8*goarch.PtrSize) != 0 {
 		// This is necessary to pick byte offsets in ptrmask0.
 		throw("rootBlockBytes must be a multiple of 8*ptrSize")
 	}
@@ -255,10 +272,10 @@ func markrootBlock(b0, n0 uintptr, ptrmask0 *uint8, gcw *gcWork, shard int) {
 	// These tests are written to avoid any possible overflow.
 	off := uintptr(shard) * rootBlockBytes
 	if off >= n0 {
-		return
+		return 0
 	}
 	b := b0 + off
-	ptrmask := (*uint8)(add(unsafe.Pointer(ptrmask0), uintptr(shard)*(rootBlockBytes/(8*sys.PtrSize))))
+	ptrmask := (*uint8)(add(unsafe.Pointer(ptrmask0), uintptr(shard)*(rootBlockBytes/(8*goarch.PtrSize))))
 	n := uintptr(rootBlockBytes)
 	if off+n > n0 {
 		n = n0 - off
@@ -266,6 +283,7 @@ func markrootBlock(b0, n0 uintptr, ptrmask0 *uint8, gcw *gcWork, shard int) {
 
 	// Scan this shard.
 	scanblock(b, n, ptrmask, gcw, nil)
+	return int64(n)
 }
 
 // markrootFreeGStacks frees stacks of dead Gs.
@@ -312,6 +330,13 @@ func markrootSpans(gcw *gcWork, shard int) {
 	// 2) Finalizer specials (which are not in the garbage
 	// collected heap) are roots. In practice, this means the fn
 	// field must be scanned.
+	//
+	// Objects with weak handles have only one invariant related
+	// to this function: weak handle specials (which are not in the
+	// garbage collected heap) are roots. In practice, this means
+	// the handle field must be scanned. Note that the value the
+	// handle pointer referenced does *not* need to be scanned. See
+	// the definition of specialWeakHandle for details.
 	sg := mheap_.sweepgen
 
 	// Find the arena and page index into that arena for this shard.
@@ -357,22 +382,32 @@ func markrootSpans(gcw *gcWork, shard int) {
 			// removed from the list while we're traversing it.
 			lock(&s.speciallock)
 			for sp := s.specials; sp != nil; sp = sp.next {
-				if sp.kind != _KindSpecialFinalizer {
-					continue
+				switch sp.kind {
+				case _KindSpecialFinalizer:
+					// don't mark finalized object, but scan it so we
+					// retain everything it points to.
+					spf := (*specialfinalizer)(unsafe.Pointer(sp))
+					// A finalizer can be set for an inner byte of an object, find object beginning.
+					p := s.base() + uintptr(spf.special.offset)/s.elemsize*s.elemsize
+
+					// Mark everything that can be reached from
+					// the object (but *not* the object itself or
+					// we'll never collect it).
+					if !s.spanclass.noscan() {
+						scanobject(p, gcw)
+					}
+
+					// The special itself is a root.
+					scanblock(uintptr(unsafe.Pointer(&spf.fn)), goarch.PtrSize, &oneptrmask[0], gcw, nil)
+				case _KindSpecialWeakHandle:
+					// The special itself is a root.
+					spw := (*specialWeakHandle)(unsafe.Pointer(sp))
+					scanblock(uintptr(unsafe.Pointer(&spw.handle)), goarch.PtrSize, &oneptrmask[0], gcw, nil)
+				case _KindSpecialCleanup:
+					spc := (*specialCleanup)(unsafe.Pointer(sp))
+					// The special itself is a root.
+					scanblock(uintptr(unsafe.Pointer(&spc.fn)), goarch.PtrSize, &oneptrmask[0], gcw, nil)
 				}
-				// don't mark finalized object, but scan it so we
-				// retain everything it points to.
-				spf := (*specialfinalizer)(unsafe.Pointer(sp))
-				// A finalizer can be set for an inner byte of an object, find object beginning.
-				p := s.base() + uintptr(spf.special.offset)/s.elemsize*s.elemsize
-
-				// Mark everything that can be reached from
-				// the object (but *not* the object itself or
-				// we'll never collect it).
-				scanobject(p, gcw)
-
-				// The special itself is a root.
-				scanblock(uintptr(unsafe.Pointer(&spf.fn)), sys.PtrSize, &oneptrmask[0], gcw, nil)
 			}
 			unlock(&s.speciallock)
 		}
@@ -380,7 +415,7 @@ func markrootSpans(gcw *gcWork, shard int) {
 }
 
 // gcAssistAlloc performs GC work to make gp's assist debt positive.
-// gp must be the calling user gorountine.
+// gp must be the calling user goroutine.
 //
 // This must be called with preemption enabled.
 func gcAssistAlloc(gp *g) {
@@ -393,14 +428,62 @@ func gcAssistAlloc(gp *g) {
 		return
 	}
 
-	traced := false
+	if gp := getg(); gp.syncGroup != nil {
+		// Disassociate the G from its synctest bubble while allocating.
+		// This is less elegant than incrementing the group's active count,
+		// but avoids any contamination between GC assist and synctest.
+		sg := gp.syncGroup
+		gp.syncGroup = nil
+		defer func() {
+			gp.syncGroup = sg
+		}()
+	}
+
+	// This extremely verbose boolean indicates whether we've
+	// entered mark assist from the perspective of the tracer.
+	//
+	// In the tracer, this is just before we call gcAssistAlloc1
+	// *regardless* of whether tracing is enabled. This is because
+	// the tracer allows for tracing to begin (and advance
+	// generations) in the middle of a GC mark phase, so we need to
+	// record some state so that the tracer can pick it up to ensure
+	// a consistent trace result.
+	//
+	// TODO(mknyszek): Hide the details of inMarkAssist in tracer
+	// functions and simplify all the state tracking. This is a lot.
+	enteredMarkAssistForTracing := false
 retry:
+	if gcCPULimiter.limiting() {
+		// If the CPU limiter is enabled, intentionally don't
+		// assist to reduce the amount of CPU time spent in the GC.
+		if enteredMarkAssistForTracing {
+			trace := traceAcquire()
+			if trace.ok() {
+				trace.GCMarkAssistDone()
+				// Set this *after* we trace the end to make sure
+				// that we emit an in-progress event if this is
+				// the first event for the goroutine in the trace
+				// or trace generation. Also, do this between
+				// acquire/release because this is part of the
+				// goroutine's trace state, and it must be atomic
+				// with respect to the tracer.
+				gp.inMarkAssist = false
+				traceRelease(trace)
+			} else {
+				// This state is tracked even if tracing isn't enabled.
+				// It's only used by the new tracer.
+				// See the comment on enteredMarkAssistForTracing.
+				gp.inMarkAssist = false
+			}
+		}
+		return
+	}
 	// Compute the amount of scan work we need to do to make the
 	// balance positive. When the required amount of work is low,
 	// we over-assist to build up credit for future allocations
 	// and amortize the cost of assisting.
-	assistWorkPerByte := float64frombits(atomic.Load64(&gcController.assistWorkPerByte))
-	assistBytesPerWork := float64frombits(atomic.Load64(&gcController.assistBytesPerWork))
+	assistWorkPerByte := gcController.assistWorkPerByte.Load()
+	assistBytesPerWork := gcController.assistBytesPerWork.Load()
 	debtBytes := -gp.gcAssistBytes
 	scanWork := int64(assistWorkPerByte * float64(debtBytes))
 	if scanWork < gcOverAssistWork {
@@ -414,7 +497,7 @@ retry:
 	// will just cause steals to fail until credit is accumulated
 	// again, so in the long run it doesn't really matter, but we
 	// do have to handle the negative credit case.
-	bgScanCredit := atomic.Loadint64(&gcController.bgScanCredit)
+	bgScanCredit := gcController.bgScanCredit.Load()
 	stolen := int64(0)
 	if bgScanCredit > 0 {
 		if bgScanCredit < scanWork {
@@ -424,23 +507,53 @@ retry:
 			stolen = scanWork
 			gp.gcAssistBytes += debtBytes
 		}
-		atomic.Xaddint64(&gcController.bgScanCredit, -stolen)
+		gcController.bgScanCredit.Add(-stolen)
 
 		scanWork -= stolen
 
 		if scanWork == 0 {
 			// We were able to steal all of the credit we
 			// needed.
-			if traced {
-				traceGCMarkAssistDone()
+			if enteredMarkAssistForTracing {
+				trace := traceAcquire()
+				if trace.ok() {
+					trace.GCMarkAssistDone()
+					// Set this *after* we trace the end to make sure
+					// that we emit an in-progress event if this is
+					// the first event for the goroutine in the trace
+					// or trace generation. Also, do this between
+					// acquire/release because this is part of the
+					// goroutine's trace state, and it must be atomic
+					// with respect to the tracer.
+					gp.inMarkAssist = false
+					traceRelease(trace)
+				} else {
+					// This state is tracked even if tracing isn't enabled.
+					// It's only used by the new tracer.
+					// See the comment on enteredMarkAssistForTracing.
+					gp.inMarkAssist = false
+				}
 			}
 			return
 		}
 	}
-
-	if trace.enabled && !traced {
-		traced = true
-		traceGCMarkAssistStart()
+	if !enteredMarkAssistForTracing {
+		trace := traceAcquire()
+		if trace.ok() {
+			trace.GCMarkAssistStart()
+			// Set this *after* we trace the start, otherwise we may
+			// emit an in-progress event for an assist we're about to start.
+			gp.inMarkAssist = true
+			traceRelease(trace)
+		} else {
+			gp.inMarkAssist = true
+		}
+		// In the new tracer, set enter mark assist tracing if we
+		// ever pass this point, because we must manage inMarkAssist
+		// correctly.
+		//
+		// See the comment on enteredMarkAssistForTracing.
+		enteredMarkAssistForTracing = true
 	}
 
 	// Perform assist work
@@ -485,8 +598,25 @@ retry:
 		// At this point either background GC has satisfied
 		// this G's assist debt, or the GC cycle is over.
 	}
-	if traced {
-		traceGCMarkAssistDone()
+	if enteredMarkAssistForTracing {
+		trace := traceAcquire()
+		if trace.ok() {
+			trace.GCMarkAssistDone()
+			// Set this *after* we trace the end to make sure
+			// that we emit an in-progress event if this is
+			// the first event for the goroutine in the trace
+			// or trace generation. Also, do this between
+			// acquire/release because this is part of the
+			// goroutine's trace state, and it must be atomic
+			// with respect to the tracer.
+			gp.inMarkAssist = false
+			traceRelease(trace)
+		} else {
+			// This state is tracked even if tracing isn't enabled.
+			// It's only used by the new tracer.
+			// See the comment on enteredMarkAssistForTracing.
+			gp.inMarkAssist = false
+		}
 	}
 }
 
@@ -509,7 +639,7 @@ func gcAssistAlloc1(gp *g, scanWork int64) {
 		// The gcBlackenEnabled check in malloc races with the
 		// store that clears it but an atomic check in every malloc
 		// would be a performance hit.
-		// Instead we recheck it here on the non-preemptable system
+		// Instead we recheck it here on the non-preemptible system
 		// stack to determine if we should perform an assist.
 
 		// GC is done, so ignore any remaining debt.
@@ -519,7 +649,11 @@ func gcAssistAlloc1(gp *g, scanWork int64) {
 	// Track time spent in this assist. Since we're on the
 	// system stack, this is non-preemptible, so we can
 	// just measure start and end time.
+	//
+	// Limiter event tracking might be disabled if we end up here
+	// while on a mark worker.
 	startTime := nanotime()
+	trackLimiterEvent := gp.m.p.ptr().limiterEvent.start(limiterEventMarkAssist, startTime)
 
 	decnwait := atomic.Xadd(&work.nwait, -1)
 	if decnwait == work.nproc {
@@ -528,8 +662,7 @@ func gcAssistAlloc1(gp *g, scanWork int64) {
 	}
 
 	// gcDrainN requires the caller to be preemptible.
-	casgstatus(gp, _Grunning, _Gwaiting)
-	gp.waitreason = waitReasonGCAssistMarking
+	casGToWaitingForGC(gp, _Grunning, waitReasonGCAssistMarking)
 
 	// drain own cached work first in the hopes that it
 	// will be more cache friendly.
@@ -544,7 +677,7 @@ func gcAssistAlloc1(gp *g, scanWork int64) {
 	// this scan work counts for. The "1+" is a poor man's
 	// round-up, to ensure this adds credit even if
 	// assistBytesPerWork is very low.
-	assistBytesPerWork := float64frombits(atomic.Load64(&gcController.assistBytesPerWork))
+	assistBytesPerWork := gcController.assistBytesPerWork.Load()
 	gp.gcAssistBytes += 1 + int64(assistBytesPerWork*float64(workDone))
 
 	// If this is the last worker and we ran out of work,
@@ -563,12 +696,17 @@ func gcAssistAlloc1(gp *g, scanWork int64) {
 		// a valid pointer).
 		gp.param = unsafe.Pointer(gp)
 	}
-	duration := nanotime() - startTime
-	_p_ := gp.m.p.ptr()
-	_p_.gcAssistTime += duration
-	if _p_.gcAssistTime > gcAssistTimeSlack {
-		atomic.Xaddint64(&gcController.assistTime, _p_.gcAssistTime)
-		_p_.gcAssistTime = 0
+	now := nanotime()
+	duration := now - startTime
+	pp := gp.m.p.ptr()
+	pp.gcAssistTime += duration
+	if trackLimiterEvent {
+		pp.limiterEvent.stop(limiterEventMarkAssist, now)
+	}
+	if pp.gcAssistTime > gcAssistTimeSlack {
+		gcController.assistTime.Add(pp.gcAssistTime)
+		gcCPULimiter.update(now)
+		pp.gcAssistTime = 0
 	}
 }
 
@@ -586,8 +724,6 @@ func gcWakeAllAssists() {
 //
 // gcParkAssist reports whether the assist is now satisfied. If it
 // returns false, the caller must retry the assist.
-//
-//go:nowritebarrier
 func gcParkAssist() bool {
 	lock(&work.assistQueue.lock)
 	// If the GC cycle finished while we were getting the lock,
@@ -606,7 +742,7 @@ func gcParkAssist() bool {
 	// the queue, but can still back out. This avoids a
 	// race in case background marking has flushed more
 	// credit since we checked above.
-	if atomic.Loadint64(&gcController.bgScanCredit) > 0 {
+	if gcController.bgScanCredit.Load() > 0 {
 		work.assistQueue.q = oldList
 		if oldList.tail != 0 {
 			oldList.tail.ptr().schedlink.set(nil)
@@ -615,7 +751,7 @@ func gcParkAssist() bool {
 		return false
 	}
 	// Park.
-	goparkunlock(&work.assistQueue.lock, waitReasonGCAssistWait, traceEvGoBlockGC, 2)
+	goparkunlock(&work.assistQueue.lock, waitReasonGCAssistWait, traceBlockGCMarkAssist, 2)
 	return true
 }
 
@@ -635,11 +771,11 @@ func gcFlushBgCredit(scanWork int64) {
 		// small window here where an assist may add itself to
 		// the blocked queue and park. If that happens, we'll
 		// just get it on the next flush.
-		atomic.Xaddint64(&gcController.bgScanCredit, scanWork)
+		gcController.bgScanCredit.Add(scanWork)
 		return
 	}
 
-	assistBytesPerWork := float64frombits(atomic.Load64(&gcController.assistBytesPerWork))
+	assistBytesPerWork := gcController.assistBytesPerWork.Load()
 	scanBytes := int64(float64(scanWork) * assistBytesPerWork)
 
 	lock(&work.assistQueue.lock)
@@ -673,14 +809,20 @@ func gcFlushBgCredit(scanWork int64) {
 
 	if scanBytes > 0 {
 		// Convert from scan bytes back to work.
-		assistWorkPerByte := float64frombits(atomic.Load64(&gcController.assistWorkPerByte))
+		assistWorkPerByte := gcController.assistWorkPerByte.Load()
 		scanWork = int64(float64(scanBytes) * assistWorkPerByte)
-		atomic.Xaddint64(&gcController.bgScanCredit, scanWork)
+		gcController.bgScanCredit.Add(scanWork)
 	}
 	unlock(&work.assistQueue.lock)
 }
 
 // scanstack scans gp's stack, greying all pointers found on the stack.
+//
+// Returns the amount of scan work performed, but doesn't update
+// gcController.stackScanWork or flush any credit. Any background credit produced
+// by this function should be flushed by its caller. scanstack itself can't
+// safely flush because it may result in trying to wake up a goroutine that
+// was just scanned, resulting in a self-deadlock.
 //
 // scanstack will also shrink the stack if it is safe to do so. If it
 // is not, it schedules a stack shrink for the next synchronous safe
@@ -691,7 +833,7 @@ func gcFlushBgCredit(scanWork int64) {
 //
 //go:nowritebarrier
 //go:systemstack
-func scanstack(gp *g, gcw *gcWork) {
+func scanstack(gp *g, gcw *gcWork) int64 {
 	if readgstatus(gp)&_Gscan == 0 {
 		print("runtime:scanstack: gp=", gp, ", goid=", gp.goid, ", gp->atomicstatus=", hex(readgstatus(gp)), "\n")
 		throw("scanstack - bad status")
@@ -702,7 +844,7 @@ func scanstack(gp *g, gcw *gcWork) {
 		print("runtime: gp=", gp, ", goid=", gp.goid, ", gp->atomicstatus=", readgstatus(gp), "\n")
 		throw("mark - bad status")
 	case _Gdead:
-		return
+		return 0
 	case _Grunning:
 		print("runtime: gp=", gp, ", goid=", gp.goid, ", gp->atomicstatus=", readgstatus(gp), "\n")
 		throw("scanstack: goroutine not stopped")
@@ -713,6 +855,23 @@ func scanstack(gp *g, gcw *gcWork) {
 	if gp == getg() {
 		throw("can't scan our own stack")
 	}
+
+	// scannedSize is the amount of work we'll be reporting.
+	//
+	// It is less than the allocated size (which is hi-lo).
+	var sp uintptr
+	if gp.syscallsp != 0 {
+		sp = gp.syscallsp // If in a system call this is the stack pointer (gp.sched.sp can be 0 in this case on Windows).
+	} else {
+		sp = gp.sched.sp
+	}
+	scannedSize := gp.stack.hi - sp
+
+	// Keep statistics for initial stack size calculation.
+	// Note that this accumulates the scanned size, not the allocated size.
+	p := getg().m.p.ptr()
+	p.scannedStackSize += uint64(scannedSize)
+	p.scannedStacks++
 
 	if isShrinkStackSafe(gp) {
 		// Shrink the stack if not much of it is being used.
@@ -737,39 +896,35 @@ func scanstack(gp *g, gcw *gcWork) {
 	// register that gets moved back and forth between the
 	// register and sched.ctxt without a write barrier.
 	if gp.sched.ctxt != nil {
-		scanblock(uintptr(unsafe.Pointer(&gp.sched.ctxt)), sys.PtrSize, &oneptrmask[0], gcw, &state)
+		scanblock(uintptr(unsafe.Pointer(&gp.sched.ctxt)), goarch.PtrSize, &oneptrmask[0], gcw, &state)
 	}
 
 	// Scan the stack. Accumulate a list of stack objects.
-	scanframe := func(frame *stkframe, unused unsafe.Pointer) bool {
-		scanframeworker(frame, &state, gcw)
-		return true
+	var u unwinder
+	for u.init(gp, 0); u.valid(); u.next() {
+		scanframeworker(&u.frame, &state, gcw)
 	}
-	gentraceback(^uintptr(0), ^uintptr(0), 0, gp, 0, nil, 0x7fffffff, scanframe, nil, 0)
 
 	// Find additional pointers that point into the stack from the heap.
 	// Currently this includes defers and panics. See also function copystack.
 
-	// Find and trace all defer arguments.
-	tracebackdefers(gp, scanframe, nil)
-
 	// Find and trace other pointers in defer records.
 	for d := gp._defer; d != nil; d = d.link {
 		if d.fn != nil {
-			// tracebackdefers above does not scan the func value, which could
-			// be a stack allocated closure. See issue 30453.
-			scanblock(uintptr(unsafe.Pointer(&d.fn)), sys.PtrSize, &oneptrmask[0], gcw, &state)
+			// Scan the func value, which could be a stack allocated closure.
+			// See issue 30453.
+			scanblock(uintptr(unsafe.Pointer(&d.fn)), goarch.PtrSize, &oneptrmask[0], gcw, &state)
 		}
 		if d.link != nil {
 			// The link field of a stack-allocated defer record might point
 			// to a heap-allocated defer record. Keep that heap record live.
-			scanblock(uintptr(unsafe.Pointer(&d.link)), sys.PtrSize, &oneptrmask[0], gcw, &state)
+			scanblock(uintptr(unsafe.Pointer(&d.link)), goarch.PtrSize, &oneptrmask[0], gcw, &state)
 		}
 		// Retain defers records themselves.
 		// Defer records might not be reachable from the G through regular heap
 		// tracing because the defer linked list might weave between the stack and the heap.
 		if d.heap {
-			scanblock(uintptr(unsafe.Pointer(&d)), sys.PtrSize, &oneptrmask[0], gcw, &state)
+			scanblock(uintptr(unsafe.Pointer(&d)), goarch.PtrSize, &oneptrmask[0], gcw, &state)
 		}
 	}
 	if gp._panic != nil {
@@ -792,46 +947,27 @@ func scanstack(gp *g, gcw *gcWork) {
 		if obj == nil {
 			continue
 		}
-		t := obj.typ
-		if t == nil {
+		r := obj.r
+		if r == nil {
 			// We've already scanned this object.
 			continue
 		}
-		obj.setType(nil) // Don't scan it again.
+		obj.setRecord(nil) // Don't scan it again.
 		if stackTraceDebug {
 			printlock()
-			print("  live stkobj at", hex(state.stack.lo+uintptr(obj.off)), "of type", t.string())
+			print("  live stkobj at", hex(state.stack.lo+uintptr(obj.off)), "of size", obj.size)
 			if conservative {
 				print(" (conservative)")
 			}
 			println()
 			printunlock()
 		}
-		gcdata := t.gcdata
-		var s *mspan
-		if t.kind&kindGCProg != 0 {
-			// This path is pretty unlikely, an object large enough
-			// to have a GC program allocated on the stack.
-			// We need some space to unpack the program into a straight
-			// bitmask, which we allocate/free here.
-			// TODO: it would be nice if there were a way to run a GC
-			// program without having to store all its bits. We'd have
-			// to change from a Lempel-Ziv style program to something else.
-			// Or we can forbid putting objects on stacks if they require
-			// a gc program (see issue 27447).
-			s = materializeGCProg(t.ptrdata, gcdata)
-			gcdata = (*byte)(unsafe.Pointer(s.startAddr))
-		}
-
+		ptrBytes, gcData := r.gcdata()
 		b := state.stack.lo + uintptr(obj.off)
 		if conservative {
-			scanConservative(b, t.ptrdata, gcdata, gcw, &state)
+			scanConservative(b, ptrBytes, gcData, gcw, &state)
 		} else {
-			scanblock(b, t.ptrdata, gcdata, gcw, &state)
-		}
-
-		if s != nil {
-			dematerializeGCProg(s)
+			scanblock(b, ptrBytes, gcData, gcw, &state)
 		}
 	}
 
@@ -843,10 +979,10 @@ func scanstack(gp *g, gcw *gcWork) {
 		if stackTraceDebug {
 			for i := 0; i < x.nobj; i++ {
 				obj := &x.obj[i]
-				if obj.typ == nil { // reachable
+				if obj.r == nil { // reachable
 					continue
 				}
-				println("  dead stkobj at", hex(gp.stack.lo+uintptr(obj.off)), "of type", obj.typ.string())
+				println("  dead stkobj at", hex(gp.stack.lo+uintptr(obj.off)), "of size", obj.r.size)
 				// Note: not necessarily really dead - only reachable-from-ptr dead.
 			}
 		}
@@ -856,17 +992,19 @@ func scanstack(gp *g, gcw *gcWork) {
 	if state.buf != nil || state.cbuf != nil || state.freeBuf != nil {
 		throw("remaining pointer buffers")
 	}
+	return int64(scannedSize)
 }
 
 // Scan a stack frame: local variables and function arguments/results.
+//
 //go:nowritebarrier
 func scanframeworker(frame *stkframe, state *stackScanState, gcw *gcWork) {
 	if _DebugGC > 1 && frame.continpc != 0 {
 		print("scanframe ", funcname(frame.fn), "\n")
 	}
 
-	isAsyncPreempt := frame.fn.valid() && frame.fn.funcID == funcID_asyncPreempt
-	isDebugCall := frame.fn.valid() && frame.fn.funcID == funcID_debugCallV2
+	isAsyncPreempt := frame.fn.valid() && frame.fn.funcID == abi.FuncID_asyncPreempt
+	isDebugCall := frame.fn.valid() && frame.fn.funcID == abi.FuncID_debugCallV2
 	if state.conservative || isAsyncPreempt || isDebugCall {
 		if debugScanConservative {
 			println("conservatively scanning function", funcname(frame.fn), "at PC", hex(frame.continpc))
@@ -888,10 +1026,10 @@ func scanframeworker(frame *stkframe, state *stackScanState, gcw *gcWork) {
 		}
 
 		// Scan arguments to this frame.
-		if frame.arglen != 0 {
+		if n := frame.argBytes(); n != 0 {
 			// TODO: We could pass the entry argument map
 			// to narrow this down further.
-			scanConservative(frame.argp, frame.arglen, nil, gcw, state)
+			scanConservative(frame.argp, n, nil, gcw, state)
 		}
 
 		if isAsyncPreempt || isDebugCall {
@@ -909,17 +1047,17 @@ func scanframeworker(frame *stkframe, state *stackScanState, gcw *gcWork) {
 		return
 	}
 
-	locals, args, objs := getStackMap(frame, &state.cache, false)
+	locals, args, objs := frame.getStackMap(false)
 
 	// Scan local variables if stack frame has been allocated.
 	if locals.n > 0 {
-		size := uintptr(locals.n) * sys.PtrSize
+		size := uintptr(locals.n) * goarch.PtrSize
 		scanblock(frame.varp-size, size, locals.bytedata, gcw, state)
 	}
 
 	// Scan arguments.
 	if args.n > 0 {
-		scanblock(frame.argp, uintptr(args.n)*sys.PtrSize, args.bytedata, gcw, state)
+		scanblock(frame.argp, uintptr(args.n)*goarch.PtrSize, args.bytedata, gcw, state)
 	}
 
 	// Add all stack objects to the stack object list.
@@ -927,7 +1065,8 @@ func scanframeworker(frame *stkframe, state *stackScanState, gcw *gcWork) {
 		// varp is 0 for defers, where there are no locals.
 		// In that case, there can't be a pointer to its args, either.
 		// (And all args would be scanned above anyway.)
-		for _, obj := range objs {
+		for i := range objs {
+			obj := &objs[i]
 			off := obj.off
 			base := frame.varp // locals base pointer
 			if off >= 0 {
@@ -939,9 +1078,9 @@ func scanframeworker(frame *stkframe, state *stackScanState, gcw *gcWork) {
 				continue
 			}
 			if stackTraceDebug {
-				println("stkobj at", hex(ptr), "of type", obj.typ.string())
+				println("stkobj at", hex(ptr), "of size", obj.size)
 			}
-			state.addObject(ptr, obj.typ)
+			state.addObject(ptr, obj)
 		}
 	}
 }
@@ -954,6 +1093,28 @@ const (
 	gcDrainIdle
 	gcDrainFractional
 )
+
+// gcDrainMarkWorkerIdle is a wrapper for gcDrain that exists to better account
+// mark time in profiles.
+func gcDrainMarkWorkerIdle(gcw *gcWork) {
+	gcDrain(gcw, gcDrainIdle|gcDrainUntilPreempt|gcDrainFlushBgCredit)
+}
+
+// gcDrainMarkWorkerDedicated is a wrapper for gcDrain that exists to better account
+// mark time in profiles.
+func gcDrainMarkWorkerDedicated(gcw *gcWork, untilPreempt bool) {
+	flags := gcDrainFlushBgCredit
+	if untilPreempt {
+		flags |= gcDrainUntilPreempt
+	}
+	gcDrain(gcw, flags)
+}
+
+// gcDrainMarkWorkerFractional is a wrapper for gcDrain that exists to better account
+// mark time in profiles.
+func gcDrainMarkWorkerFractional(gcw *gcWork) {
+	gcDrain(gcw, gcDrainFractional|gcDrainUntilPreempt|gcDrainFlushBgCredit)
+}
 
 // gcDrain scans roots and objects in work buffers, blackening grey
 // objects until it is unable to get more work. It may return before
@@ -974,20 +1135,31 @@ const (
 // credit to gcController.bgScanCredit every gcCreditSlack units of
 // scan work.
 //
-// gcDrain will always return if there is a pending STW.
+// gcDrain will always return if there is a pending STW or forEachP.
+//
+// Disabling write barriers is necessary to ensure that after we've
+// confirmed that we've drained gcw, that we don't accidentally end
+// up flipping that condition by immediately adding work in the form
+// of a write barrier buffer flush.
+//
+// Don't set nowritebarrierrec because it's safe for some callees to
+// have write barriers enabled.
 //
 //go:nowritebarrier
 func gcDrain(gcw *gcWork, flags gcDrainFlags) {
-	if !writeBarrier.needed {
+	if !writeBarrier.enabled {
 		throw("gcDrain phase incorrect")
 	}
 
+	// N.B. We must be running in a non-preemptible context, so it's
+	// safe to hold a reference to our P here.
 	gp := getg().m.curg
+	pp := gp.m.p.ptr()
 	preemptible := flags&gcDrainUntilPreempt != 0
 	flushBgCredit := flags&gcDrainFlushBgCredit != 0
 	idle := flags&gcDrainIdle != 0
 
-	initScanWork := gcw.scanWork
+	initScanWork := gcw.heapScanWork
 
 	// checkWork is the scan work before performing the next
 	// self-preempt check.
@@ -1004,13 +1176,14 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 
 	// Drain root marking jobs.
 	if work.markrootNext < work.markrootJobs {
-		// Stop if we're preemptible or if someone wants to STW.
-		for !(gp.preempt && (preemptible || atomic.Load(&sched.gcwaiting) != 0)) {
+		// Stop if we're preemptible, if someone wants to STW, or if
+		// someone is calling forEachP.
+		for !(gp.preempt && (preemptible || sched.gcwaiting.Load() || pp.runSafePointFn != 0)) {
 			job := atomic.Xadd(&work.markrootNext, +1) - 1
 			if job >= work.markrootJobs {
 				break
 			}
-			markroot(gcw, job)
+			markroot(gcw, job, flushBgCredit)
 			if check != nil && check() {
 				goto done
 			}
@@ -1018,8 +1191,16 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 	}
 
 	// Drain heap marking jobs.
-	// Stop if we're preemptible or if someone wants to STW.
-	for !(gp.preempt && (preemptible || atomic.Load(&sched.gcwaiting) != 0)) {
+	//
+	// Stop if we're preemptible, if someone wants to STW, or if
+	// someone is calling forEachP.
+	//
+	// TODO(mknyszek): Consider always checking gp.preempt instead
+	// of having the preempt flag, and making an exception for certain
+	// mark workers in retake. That might be simpler than trying to
+	// enumerate all the reasons why we might want to preempt, even
+	// if we're supposed to be mostly non-preemptible.
+	for !(gp.preempt && (preemptible || sched.gcwaiting.Load() || pp.runSafePointFn != 0)) {
 		// Try to keep work available on the global queue. We used to
 		// check if there were waiting workers, but it's better to
 		// just keep work available than to make workers wait. In the
@@ -1036,7 +1217,7 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 				// Flush the write barrier
 				// buffer; this may create
 				// more work.
-				wbBufFlush(nil, 0)
+				wbBufFlush()
 				b = gcw.tryGet()
 			}
 		}
@@ -1049,14 +1230,14 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 		// Flush background scan work credit to the global
 		// account if we've accumulated enough locally so
 		// mutator assists can draw on it.
-		if gcw.scanWork >= gcCreditSlack {
-			atomic.Xaddint64(&gcController.scanWork, gcw.scanWork)
+		if gcw.heapScanWork >= gcCreditSlack {
+			gcController.heapScanWork.Add(gcw.heapScanWork)
 			if flushBgCredit {
-				gcFlushBgCredit(gcw.scanWork - initScanWork)
+				gcFlushBgCredit(gcw.heapScanWork - initScanWork)
 				initScanWork = 0
 			}
-			checkWork -= gcw.scanWork
-			gcw.scanWork = 0
+			checkWork -= gcw.heapScanWork
+			gcw.heapScanWork = 0
 
 			if checkWork <= 0 {
 				checkWork += drainCheckThreshold
@@ -1069,12 +1250,12 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 
 done:
 	// Flush remaining scan work credit.
-	if gcw.scanWork > 0 {
-		atomic.Xaddint64(&gcController.scanWork, gcw.scanWork)
+	if gcw.heapScanWork > 0 {
+		gcController.heapScanWork.Add(gcw.heapScanWork)
 		if flushBgCredit {
-			gcFlushBgCredit(gcw.scanWork - initScanWork)
+			gcFlushBgCredit(gcw.heapScanWork - initScanWork)
 		}
-		gcw.scanWork = 0
+		gcw.heapScanWork = 0
 	}
 }
 
@@ -1092,59 +1273,54 @@ done:
 //go:nowritebarrier
 //go:systemstack
 func gcDrainN(gcw *gcWork, scanWork int64) int64 {
-	if !writeBarrier.needed {
+	if !writeBarrier.enabled {
 		throw("gcDrainN phase incorrect")
 	}
 
 	// There may already be scan work on the gcw, which we don't
 	// want to claim was done by this call.
-	workFlushed := -gcw.scanWork
+	workFlushed := -gcw.heapScanWork
 
+	// In addition to backing out because of a preemption, back out
+	// if the GC CPU limiter is enabled.
 	gp := getg().m.curg
-	for !gp.preempt && workFlushed+gcw.scanWork < scanWork {
+	for !gp.preempt && !gcCPULimiter.limiting() && workFlushed+gcw.heapScanWork < scanWork {
 		// See gcDrain comment.
 		if work.full == 0 {
 			gcw.balance()
 		}
 
-		// This might be a good place to add prefetch code...
-		// if(wbuf.nobj > 4) {
-		//         PREFETCH(wbuf->obj[wbuf.nobj - 3];
-		//  }
-		//
 		b := gcw.tryGetFast()
 		if b == 0 {
 			b = gcw.tryGet()
 			if b == 0 {
 				// Flush the write barrier buffer;
 				// this may create more work.
-				wbBufFlush(nil, 0)
+				wbBufFlush()
 				b = gcw.tryGet()
 			}
 		}
 
 		if b == 0 {
 			// Try to do a root job.
-			//
-			// TODO: Assists should get credit for this
-			// work.
 			if work.markrootNext < work.markrootJobs {
 				job := atomic.Xadd(&work.markrootNext, +1) - 1
 				if job < work.markrootJobs {
-					markroot(gcw, job)
+					workFlushed += markroot(gcw, job, false)
 					continue
 				}
 			}
 			// No heap or root jobs.
 			break
 		}
+
 		scanobject(b, gcw)
 
 		// Flush background scan work credit.
-		if gcw.scanWork >= gcCreditSlack {
-			atomic.Xaddint64(&gcController.scanWork, gcw.scanWork)
-			workFlushed += gcw.scanWork
-			gcw.scanWork = 0
+		if gcw.heapScanWork >= gcCreditSlack {
+			gcController.heapScanWork.Add(gcw.heapScanWork)
+			workFlushed += gcw.heapScanWork
+			gcw.heapScanWork = 0
 		}
 	}
 
@@ -1152,16 +1328,17 @@ func gcDrainN(gcw *gcWork, scanWork int64) int64 {
 	// here because this never flushes to bgScanCredit and
 	// gcw.dispose will flush any remaining work to scanWork.
 
-	return workFlushed + gcw.scanWork
+	return workFlushed + gcw.heapScanWork
 }
 
 // scanblock scans b as scanobject would, but using an explicit
 // pointer bitmap instead of the heap bitmap.
 //
 // This is used to scan non-heap roots, so it does not update
-// gcw.bytesMarked or gcw.scanWork.
+// gcw.bytesMarked or gcw.heapScanWork.
 //
 // If stk != nil, possible stack pointers are also reported to stk.putPtr.
+//
 //go:nowritebarrier
 func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState) {
 	// Use local copies of original parameters, so that a stack trace
@@ -1172,9 +1349,9 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState)
 
 	for i := uintptr(0); i < n; {
 		// Find bits for the next word.
-		bits := uint32(*addb(ptrmask, i/(sys.PtrSize*8)))
+		bits := uint32(*addb(ptrmask, i/(goarch.PtrSize*8)))
 		if bits == 0 {
-			i += sys.PtrSize * 8
+			i += goarch.PtrSize * 8
 			continue
 		}
 		for j := 0; j < 8 && i < n; j++ {
@@ -1190,7 +1367,7 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState)
 				}
 			}
 			bits >>= 1
-			i += sys.PtrSize
+			i += goarch.PtrSize
 		}
 	}
 }
@@ -1202,33 +1379,33 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState)
 //
 //go:nowritebarrier
 func scanobject(b uintptr, gcw *gcWork) {
+	// Prefetch object before we scan it.
+	//
+	// This will overlap fetching the beginning of the object with initial
+	// setup before we start scanning the object.
+	sys.Prefetch(b)
+
 	// Find the bits for b and the size of the object at b.
 	//
 	// b is either the beginning of an object, in which case this
 	// is the size of the object to scan, or it points to an
 	// oblet, in which case we compute the size to scan below.
-	hbits := heapBitsForAddr(b)
 	s := spanOfUnchecked(b)
 	n := s.elemsize
 	if n == 0 {
 		throw("scanobject n == 0")
 	}
+	if s.spanclass.noscan() {
+		// Correctness-wise this is ok, but it's inefficient
+		// if noscan objects reach here.
+		throw("scanobject of a noscan object")
+	}
 
+	var tp typePointers
 	if n > maxObletBytes {
 		// Large object. Break into oblets for better
 		// parallelism and lower latency.
 		if b == s.base() {
-			// It's possible this is a noscan object (not
-			// from greyobject, but from other code
-			// paths), in which case we must *not* enqueue
-			// oblets since their bitmaps will be
-			// uninitialized.
-			if s.spanclass.noscan() {
-				// Bypass the whole scan.
-				gcw.bytesMarked += uint64(n)
-				return
-			}
-
 			// Enqueue the other oblets to scan later.
 			// Some oblets may be in b's scalar tail, but
 			// these will be marked as "no more pointers",
@@ -1245,25 +1422,30 @@ func scanobject(b uintptr, gcw *gcWork) {
 		// must be a large object, s.base() is the beginning
 		// of the object.
 		n = s.base() + s.elemsize - b
-		if n > maxObletBytes {
-			n = maxObletBytes
-		}
+		n = min(n, maxObletBytes)
+		tp = s.typePointersOfUnchecked(s.base())
+		tp = tp.fastForward(b-tp.addr, b+n)
+	} else {
+		tp = s.typePointersOfUnchecked(b)
 	}
 
-	var i uintptr
-	for i = 0; i < n; i, hbits = i+sys.PtrSize, hbits.next() {
-		// Load bits once. See CL 22712 and issue 16973 for discussion.
-		bits := hbits.bits()
-		if bits&bitScan == 0 {
-			break // no more pointers in this object
+	var scanSize uintptr
+	for {
+		var addr uintptr
+		if tp, addr = tp.nextFast(); addr == 0 {
+			if tp, addr = tp.next(b + n); addr == 0 {
+				break
+			}
 		}
-		if bits&bitPointer == 0 {
-			continue // not a pointer
-		}
+
+		// Keep track of farthest pointer we found, so we can
+		// update heapScanWork. TODO: is there a better metric,
+		// now that we can skip scalar portions pretty efficiently?
+		scanSize = addr - b + goarch.PtrSize
 
 		// Work here is duplicated in scanblock and above.
 		// If you make changes here, make changes there too.
-		obj := *(*uintptr)(unsafe.Pointer(b + i))
+		obj := *(*uintptr)(unsafe.Pointer(addr))
 
 		// At this point we have extracted the next potential pointer.
 		// Quickly filter out nil and pointers back to the current object.
@@ -1277,13 +1459,13 @@ func scanobject(b uintptr, gcw *gcWork) {
 			// heap. In this case, we know the object was
 			// just allocated and hence will be marked by
 			// allocation itself.
-			if obj, span, objIndex := findObject(obj, b, i); obj != 0 {
-				greyobject(obj, b, i, span, gcw, objIndex)
+			if obj, span, objIndex := findObject(obj, b, addr-b); obj != 0 {
+				greyobject(obj, b, addr-b, span, gcw, objIndex)
 			}
 		}
 	}
 	gcw.bytesMarked += uint64(n)
-	gcw.scanWork += int64(i)
+	gcw.heapScanWork += int64(scanSize)
 }
 
 // scanConservative scans block [b, b+n) conservatively, treating any
@@ -1300,7 +1482,7 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 		print("conservatively scanning [", hex(b), ",", hex(b+n), ")\n")
 		hexdumpWords(b, b+n, func(p uintptr) byte {
 			if ptrmask != nil {
-				word := (p - b) / sys.PtrSize
+				word := (p - b) / goarch.PtrSize
 				bits := *addb(ptrmask, word/8)
 				if (bits>>(word%8))&1 == 0 {
 					return '$'
@@ -1325,9 +1507,9 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 		printunlock()
 	}
 
-	for i := uintptr(0); i < n; i += sys.PtrSize {
+	for i := uintptr(0); i < n; i += goarch.PtrSize {
 		if ptrmask != nil {
-			word := i / sys.PtrSize
+			word := i / goarch.PtrSize
 			bits := *addb(ptrmask, word/8)
 			if bits == 0 {
 				// Skip 8 words (the loop increment will do the 8th)
@@ -1336,10 +1518,10 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 				// seen this word of ptrmask, so i
 				// must be 8-word-aligned, but check
 				// our reasoning just in case.
-				if i%(sys.PtrSize*8) != 0 {
+				if i%(goarch.PtrSize*8) != 0 {
 					throw("misaligned mask")
 				}
-				i += sys.PtrSize*8 - sys.PtrSize
+				i += goarch.PtrSize*8 - goarch.PtrSize
 				continue
 			}
 			if (bits>>(word%8))&1 == 0 {
@@ -1384,6 +1566,7 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 // Shade the object if it isn't already.
 // The object is not nil and known to be in the heap.
 // Preemption must be disabled.
+//
 //go:nowritebarrier
 func shade(b uintptr) {
 	if obj, span, objIndex := findObject(b, 0, 0); obj != 0 {
@@ -1401,7 +1584,7 @@ func shade(b uintptr) {
 //go:nowritebarrierrec
 func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintptr) {
 	// obj should be start of allocation, and so must be at least pointer-aligned.
-	if obj&(sys.PtrSize-1) != 0 {
+	if obj&(goarch.PtrSize-1) != 0 {
 		throw("greyobject: obj not pointer-aligned")
 	}
 	mbits := span.markBitsForIndex(objIndex)
@@ -1440,12 +1623,12 @@ func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintp
 		}
 	}
 
-	// Queue the obj for scanning. The PREFETCH(obj) logic has been removed but
-	// seems like a nice optimization that can be added back in.
-	// There needs to be time between the PREFETCH and the use.
-	// Previously we put the obj in an 8 element buffer that is drained at a rate
-	// to give the PREFETCH time to do its work.
-	// Use of PREFETCHNTA might be more appropriate than PREFETCH
+	// We're adding obj to P's local workbuf, so it's likely
+	// this object will be processed soon by the same P.
+	// Even if the workbuf gets flushed, there will likely still be
+	// some benefit on platforms with inclusive shared caches.
+	sys.Prefetch(obj)
+	// Queue the obj for scanning.
 	if !gcw.putFast(obj) {
 		gcw.put(obj)
 	}
@@ -1473,13 +1656,13 @@ func gcDumpObject(label string, obj, off uintptr) {
 		// We're printing something from a stack frame. We
 		// don't know how big it is, so just show up to an
 		// including off.
-		size = off + sys.PtrSize
+		size = off + goarch.PtrSize
 	}
-	for i := uintptr(0); i < size; i += sys.PtrSize {
+	for i := uintptr(0); i < size; i += goarch.PtrSize {
 		// For big objects, just print the beginning (because
 		// that usually hints at the object's type) and the
 		// fields around off.
-		if !(i < 128*sys.PtrSize || off-16*sys.PtrSize < i && i < off+16*sys.PtrSize) {
+		if !(i < 128*goarch.PtrSize || off-16*goarch.PtrSize < i && i < off+16*goarch.PtrSize) {
 			skipped = true
 			continue
 		}
@@ -1505,9 +1688,13 @@ func gcDumpObject(label string, obj, off uintptr) {
 //
 //go:nowritebarrier
 //go:nosplit
-func gcmarknewobject(span *mspan, obj, size, scanSize uintptr) {
+func gcmarknewobject(span *mspan, obj uintptr) {
 	if useCheckmark { // The world should be stopped so this should not happen.
 		throw("gcmarknewobject called while doing checkmark")
+	}
+	if gcphase == _GCmarktermination {
+		// Check this here instead of on the hot path.
+		throw("mallocgc called with gcphase == _GCmarktermination")
 	}
 
 	// Mark object.
@@ -1521,8 +1708,7 @@ func gcmarknewobject(span *mspan, obj, size, scanSize uintptr) {
 	}
 
 	gcw := &getg().m.p.ptr().gcw
-	gcw.bytesMarked += uint64(size)
-	gcw.scanWork += int64(scanSize)
+	gcw.bytesMarked += uint64(span.elemsize)
 }
 
 // gcMarkTinyAllocs greys all active tiny alloc blocks.

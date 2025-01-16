@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"fmt"
 	"go/ast"
-	"go/internal/typeparams"
 )
 
 // ExprString returns the (possibly shortened) string representation for x.
@@ -33,7 +32,7 @@ func WriteExpr(buf *bytes.Buffer, x ast.Expr) {
 
 	switch x := x.(type) {
 	default:
-		buf.WriteString(fmt.Sprintf("(ast: %T)", x)) // nil, ast.BadExpr, ast.KeyValueExpr
+		fmt.Fprintf(buf, "(ast: %T)", x) // nil, ast.BadExpr, ast.KeyValueExpr
 
 	case *ast.Ident:
 		buf.WriteString(x.Name)
@@ -53,9 +52,12 @@ func WriteExpr(buf *bytes.Buffer, x ast.Expr) {
 		buf.WriteString(" literal)") // shortened
 
 	case *ast.CompositeLit:
-		buf.WriteByte('(')
 		WriteExpr(buf, x.Type)
-		buf.WriteString(" literal)") // shortened
+		buf.WriteByte('{')
+		if len(x.Elts) > 0 {
+			buf.WriteString("…")
+		}
+		buf.WriteByte('}')
 
 	case *ast.ParenExpr:
 		buf.WriteByte('(')
@@ -67,16 +69,11 @@ func WriteExpr(buf *bytes.Buffer, x ast.Expr) {
 		buf.WriteByte('.')
 		buf.WriteString(x.Sel.Name)
 
-	case *ast.IndexExpr:
-		WriteExpr(buf, x.X)
+	case *ast.IndexExpr, *ast.IndexListExpr:
+		ix := unpackIndexedExpr(x)
+		WriteExpr(buf, ix.x)
 		buf.WriteByte('[')
-		exprs := typeparams.UnpackExpr(x.Index)
-		for i, e := range exprs {
-			if i > 0 {
-				buf.WriteString(", ")
-			}
-			WriteExpr(buf, e)
-		}
+		writeExprList(buf, ix.indices)
 		buf.WriteByte(']')
 
 	case *ast.SliceExpr:
@@ -107,7 +104,7 @@ func WriteExpr(buf *bytes.Buffer, x ast.Expr) {
 		WriteExpr(buf, x.Fun)
 		buf.WriteByte('(')
 		writeExprList(buf, x.Args)
-		if x.Ellipsis.IsValid() {
+		if hasDots(x) {
 			buf.WriteString("...")
 		}
 		buf.WriteByte(')')
@@ -145,29 +142,8 @@ func WriteExpr(buf *bytes.Buffer, x ast.Expr) {
 		writeSigExpr(buf, x)
 
 	case *ast.InterfaceType:
-		// separate type list types from method list
-		// TODO(gri) we can get rid of this extra code if writeExprList does the separation
-		var types []ast.Expr
-		var methods []*ast.Field
-		for _, f := range x.Methods.List {
-			if len(f.Names) > 1 && f.Names[0].Name == "type" {
-				// type list type
-				types = append(types, f.Type)
-			} else {
-				// method or embedded interface
-				methods = append(methods, f)
-			}
-		}
-
 		buf.WriteString("interface{")
-		writeFieldList(buf, methods, "; ", true)
-		if len(types) > 0 {
-			if len(methods) > 0 {
-				buf.WriteString("; ")
-			}
-			buf.WriteString("type ")
-			writeExprList(buf, types)
-		}
+		writeFieldList(buf, x.Methods.List, "; ", true)
 		buf.WriteByte('}')
 
 	case *ast.MapType:

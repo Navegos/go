@@ -8,24 +8,30 @@ import (
 	"bufio"
 	"bytes"
 	"cmd/compile/internal/base"
-	"cmd/compile/internal/deadcode"
-	"cmd/compile/internal/devirtualize"
+	"cmd/compile/internal/coverage"
+	"cmd/compile/internal/deadlocals"
 	"cmd/compile/internal/dwarfgen"
 	"cmd/compile/internal/escape"
 	"cmd/compile/internal/inline"
+	"cmd/compile/internal/inline/interleaved"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/logopt"
+	"cmd/compile/internal/loopvar"
 	"cmd/compile/internal/noder"
+	"cmd/compile/internal/pgoir"
 	"cmd/compile/internal/pkginit"
 	"cmd/compile/internal/reflectdata"
+	"cmd/compile/internal/rttype"
 	"cmd/compile/internal/ssa"
 	"cmd/compile/internal/ssagen"
+	"cmd/compile/internal/staticinit"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/dwarf"
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"cmd/internal/src"
+	"cmd/internal/telemetry/counter"
 	"flag"
 	"fmt"
 	"internal/buildcfg"
@@ -34,18 +40,18 @@ import (
 	"runtime"
 )
 
-func hidePanic() {
-	if base.Debug.Panic == 0 && base.Errors() > 0 {
-		// If we've already complained about things
-		// in the program, don't bother complaining
-		// about a panic too; let the user clean up
-		// the code and try again.
-		if err := recover(); err != nil {
-			if err == "-h" {
-				panic(err)
-			}
-			base.ErrorExit()
+// handlePanic ensures that we print out an "internal compiler error" for any panic
+// or runtime exception during front-end compiler processing (unless there have
+// already been some compiler errors). It may also be invoked from the explicit panic in
+// hcrash(), in which case, we pass the panic on through.
+func handlePanic() {
+	if err := recover(); err != nil {
+		if err == "-h" {
+			// Force real panic now with -h option (hcrash) - the error
+			// information will have already been printed.
+			panic(err)
 		}
+		base.Fatalf("panic: %v", err)
 	}
 }
 
@@ -54,8 +60,10 @@ func hidePanic() {
 // code, and finally writes the compiled package definition to disk.
 func Main(archInit func(*ssagen.ArchInfo)) {
 	base.Timer.Start("fe", "init")
+	counter.Open()
+	counter.Inc("compile/invocations")
 
-	defer hidePanic()
+	defer handlePanic()
 
 	archInit(&ssagen.Arch)
 
@@ -70,20 +78,23 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// See bugs 31188 and 21945 (CLs 170638, 98075, 72371).
 	base.Ctxt.UseBASEntries = base.Ctxt.Headtype != objabi.Hdarwin
 
-	types.LocalPkg = types.NewPkg("", "")
-	types.LocalPkg.Prefix = "\"\""
+	base.DebugSSA = ssa.PhaseOption
+	base.ParseFlags()
 
-	// We won't know localpkg's height until after import
-	// processing. In the mean time, set to MaxPkgHeight to ensure
-	// height comparisons at least work until then.
-	types.LocalPkg.Height = types.MaxPkgHeight
+	if os.Getenv("GOGC") == "" { // GOGC set disables starting heap adjustment
+		// More processors will use more heap, but assume that more memory is available.
+		// So 1 processor -> 40MB, 4 -> 64MB, 12 -> 128MB
+		base.AdjustStartingHeap(uint64(32+8*base.Flag.LowerC) << 20)
+	}
+
+	types.LocalPkg = types.NewPkg(base.Ctxt.Pkgpath, "")
 
 	// pseudo-package, for scoping
 	types.BuiltinPkg = types.NewPkg("go.builtin", "") // TODO(gri) name this package go.builtin?
-	types.BuiltinPkg.Prefix = "go.builtin"            // not go%2ebuiltin
+	types.BuiltinPkg.Prefix = "go:builtin"
 
 	// pseudo-package, accessed by import "unsafe"
-	ir.Pkgs.Unsafe = types.NewPkg("unsafe", "unsafe")
+	types.UnsafePkg = types.NewPkg("unsafe", "unsafe")
 
 	// Pseudo-package that contains the compiler's builtin
 	// declarations for package runtime. These are declared in a
@@ -93,20 +104,28 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	ir.Pkgs.Runtime = types.NewPkg("go.runtime", "runtime")
 	ir.Pkgs.Runtime.Prefix = "runtime"
 
+	if buildcfg.Experiment.SwissMap {
+		// Pseudo-package that contains the compiler's builtin
+		// declarations for maps.
+		ir.Pkgs.InternalMaps = types.NewPkg("go.internal/runtime/maps", "internal/runtime/maps")
+		ir.Pkgs.InternalMaps.Prefix = "internal/runtime/maps"
+	}
+
 	// pseudo-packages used in symbol tables
 	ir.Pkgs.Itab = types.NewPkg("go.itab", "go.itab")
-	ir.Pkgs.Itab.Prefix = "go.itab" // not go%2eitab
+	ir.Pkgs.Itab.Prefix = "go:itab"
 
 	// pseudo-package used for methods with anonymous receivers
 	ir.Pkgs.Go = types.NewPkg("go", "")
 
-	base.DebugSSA = ssa.PhaseOption
-	base.ParseFlags()
+	// pseudo-package for use with code coverage instrumentation.
+	ir.Pkgs.Coverage = types.NewPkg("go.coverage", "runtime/coverage")
+	ir.Pkgs.Coverage.Prefix = "runtime/coverage"
 
 	// Record flags that affect the build result. (And don't
 	// record flags that don't, since that would cause spurious
 	// changes in the binary.)
-	dwarfgen.RecordFlags("B", "N", "l", "msan", "race", "shared", "dynlink", "dwarf", "dwarflocationlists", "dwarfbasentries", "smallframes", "spectre")
+	dwarfgen.RecordFlags("B", "N", "l", "msan", "race", "asan", "shared", "dynlink", "dwarf", "dwarflocationlists", "dwarfbasentries", "smallframes", "spectre")
 
 	if !base.EnableTrace && base.Flag.LowerT {
 		log.Fatalf("compiler not built with support for -t")
@@ -121,7 +140,7 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	}
 
 	if base.Flag.SmallFrames {
-		ir.MaxStackVarSize = 128 * 1024
+		ir.MaxStackVarSize = 64 * 1024
 		ir.MaxImplicitStackVarSize = 16 * 1024
 	}
 
@@ -140,28 +159,26 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	types.ParseLangFlag()
 
-	symABIs := ssagen.NewSymABIs(base.Ctxt.Pkgpath)
+	symABIs := ssagen.NewSymABIs()
 	if base.Flag.SymABIs != "" {
 		symABIs.ReadSymABIs(base.Flag.SymABIs)
 	}
 
-	if base.Compiling(base.NoInstrumentPkgs) {
+	if objabi.LookupPkgSpecial(base.Ctxt.Pkgpath).NoInstrument {
 		base.Flag.Race = false
 		base.Flag.MSan = false
+		base.Flag.ASan = false
 	}
 
 	ssagen.Arch.LinkArch.Init(base.Ctxt)
 	startProfile()
-	if base.Flag.Race || base.Flag.MSan {
+	if base.Flag.Race || base.Flag.MSan || base.Flag.ASan {
 		base.Flag.Cfg.Instrumenting = true
 	}
 	if base.Flag.Dwarf {
 		dwarf.EnableLogging(base.Debug.DwarfInl != 0)
 	}
 	if base.Debug.SoftFloat != 0 {
-		if buildcfg.Experiment.RegabiArgs {
-			log.Fatalf("softfloat mode with GOEXPERIMENT=regabiargs not implemented ")
-		}
 		ssagen.Arch.SoftFloat = true
 	}
 
@@ -181,65 +198,64 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	typecheck.Target = new(ir.Package)
 
-	typecheck.NeedITab = func(t, iface *types.Type) { reflectdata.ITabAddr(t, iface) }
-	typecheck.NeedRuntimeType = reflectdata.NeedRuntimeType // TODO(rsc): TypeSym for lock?
-
 	base.AutogeneratedPos = makePos(src.NewFileBase("<autogenerated>", "<autogenerated>"), 1, 0)
 
 	typecheck.InitUniverse()
+	typecheck.InitRuntime()
+	rttype.Init()
 
 	// Parse and typecheck input.
 	noder.LoadPackage(flag.Args())
 
+	// As a convenience to users (toolchain maintainers, in particular),
+	// when compiling a package named "main", we default the package
+	// path to "main" if the -p flag was not specified.
+	if base.Ctxt.Pkgpath == obj.UnlinkablePkg && types.LocalPkg.Name == "main" {
+		base.Ctxt.Pkgpath = "main"
+		types.LocalPkg.Path = "main"
+		types.LocalPkg.Prefix = "main"
+	}
+
 	dwarfgen.RecordPackageName()
 
-	// Build init task.
-	if initTask := pkginit.Task(); initTask != nil {
-		typecheck.Export(initTask)
-	}
+	// Prepare for backend processing.
+	ssagen.InitConfig()
 
-	// Eliminate some obviously dead code.
-	// Must happen after typechecking.
-	for _, n := range typecheck.Target.Decls {
-		if n.Op() == ir.ODCLFUNC {
-			deadcode.Func(n.(*ir.Func))
+	// Apply coverage fixups, if applicable.
+	coverage.Fixup()
+
+	// Read profile file and build profile-graph and weighted-call-graph.
+	base.Timer.Start("fe", "pgo-load-profile")
+	var profile *pgoir.Profile
+	if base.Flag.PgoProfile != "" {
+		var err error
+		profile, err = pgoir.New(base.Flag.PgoProfile)
+		if err != nil {
+			log.Fatalf("%s: PGO error: %v", base.Flag.PgoProfile, err)
 		}
 	}
 
-	// Compute Addrtaken for names.
-	// We need to wait until typechecking is done so that when we see &x[i]
-	// we know that x has its address taken if x is an array, but not if x is a slice.
-	// We compute Addrtaken in bulk here.
-	// After this phase, we maintain Addrtaken incrementally.
-	if typecheck.DirtyAddrtaken {
-		typecheck.ComputeAddrtaken(typecheck.Target.Decls)
-		typecheck.DirtyAddrtaken = false
-	}
-	typecheck.IncrementalAddrtaken = true
+	// Interleaved devirtualization and inlining.
+	base.Timer.Start("fe", "devirtualize-and-inline")
+	interleaved.DevirtualizeAndInlinePackage(typecheck.Target, profile)
 
-	if base.Debug.TypecheckInl != 0 {
-		// Typecheck imported function bodies if Debug.l > 1,
-		// otherwise lazily when used or re-exported.
-		typecheck.AllImportedBodies()
-	}
+	noder.MakeWrappers(typecheck.Target) // must happen after inlining
 
-	// Inlining
-	base.Timer.Start("fe", "inlining")
-	if base.Flag.LowerL != 0 {
-		inline.InlinePackage()
-	}
-
-	// Devirtualize.
-	for _, n := range typecheck.Target.Decls {
-		if n.Op() == ir.ODCLFUNC {
-			devirtualize.Func(n.(*ir.Func))
-		}
+	// Get variable capture right in for loops.
+	var transformed []loopvar.VarAndLoop
+	for _, fn := range typecheck.Target.Funcs {
+		transformed = append(transformed, loopvar.ForCapture(fn)...)
 	}
 	ir.CurFunc = nil
+
+	// Build init task, if needed.
+	pkginit.MakeTask()
 
 	// Generate ABI wrappers. Must happen before escape analysis
 	// and doesn't benefit from dead-coding or inlining.
 	symABIs.GenABIWrappers()
+
+	deadlocals.Funcs(typecheck.Target.Funcs)
 
 	// Escape analysis.
 	// Required for moving heap allocations onto stack,
@@ -250,7 +266,9 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// Large values are also moved off stack in escape analysis;
 	// because large values may contain pointers, it must happen early.
 	base.Timer.Start("fe", "escapes")
-	escape.Funcs(typecheck.Target.Decls)
+	escape.Funcs(typecheck.Target.Funcs)
+
+	loopvar.LogTransformations(transformed)
 
 	// Collect information for go:nowritebarrierrec
 	// checking. This must happen before transforming closures during Walk
@@ -260,44 +278,73 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 		ssagen.EnableNoWriteBarrierRecCheck()
 	}
 
-	// Prepare for SSA compilation.
-	// This must be before CompileITabs, because CompileITabs
-	// can trigger function compilation.
-	typecheck.InitRuntime()
-	ssagen.InitConfig()
-
-	// Just before compilation, compile itabs found on
-	// the right side of OCONVIFACE so that methods
-	// can be de-virtualized during compilation.
 	ir.CurFunc = nil
-	reflectdata.CompileITabs()
 
-	// Compile top level functions.
-	// Don't use range--walk can add functions to Target.Decls.
+	reflectdata.WriteBasicTypes()
+
+	// Compile top-level declarations.
+	//
+	// There are cyclic dependencies between all of these phases, so we
+	// need to iterate all of them until we reach a fixed point.
 	base.Timer.Start("be", "compilefuncs")
-	fcount := int64(0)
-	for i := 0; i < len(typecheck.Target.Decls); i++ {
-		if fn, ok := typecheck.Target.Decls[i].(*ir.Func); ok {
-			enqueueFunc(fn)
-			fcount++
-		}
-	}
-	base.Timer.AddEvent(fcount, "funcs")
+	for nextFunc, nextExtern := 0, 0; ; {
+		reflectdata.WriteRuntimeTypes()
 
-	compileFunctions()
+		if nextExtern < len(typecheck.Target.Externs) {
+			switch n := typecheck.Target.Externs[nextExtern]; n.Op() {
+			case ir.ONAME:
+				dumpGlobal(n)
+			case ir.OLITERAL:
+				dumpGlobalConst(n)
+			case ir.OTYPE:
+				reflectdata.NeedRuntimeType(n.Type())
+			}
+			nextExtern++
+			continue
+		}
+
+		if nextFunc < len(typecheck.Target.Funcs) {
+			enqueueFunc(typecheck.Target.Funcs[nextFunc])
+			nextFunc++
+			continue
+		}
+
+		// The SSA backend supports using multiple goroutines, so keep it
+		// as late as possible to maximize how much work we can batch and
+		// process concurrently.
+		if len(compilequeue) != 0 {
+			compileFunctions(profile)
+			continue
+		}
+
+		// Finalize DWARF inline routine DIEs, then explicitly turn off
+		// further DWARF inlining generation to avoid problems with
+		// generated method wrappers.
+		//
+		// Note: The DWARF fixup code for inlined calls currently doesn't
+		// allow multiple invocations, so we intentionally run it just
+		// once after everything else. Worst case, some generated
+		// functions have slightly larger DWARF DIEs.
+		if base.Ctxt.DwFixups != nil {
+			base.Ctxt.DwFixups.Finalize(base.Ctxt.Pkgpath, base.Debug.DwarfInl != 0)
+			base.Ctxt.DwFixups = nil
+			base.Flag.GenDwarfInl = 0
+			continue // may have called reflectdata.TypeLinksym (#62156)
+		}
+
+		break
+	}
+
+	base.Timer.AddEvent(int64(len(typecheck.Target.Funcs)), "funcs")
 
 	if base.Flag.CompilingRuntime {
 		// Write barriers are now known. Check the call graph.
 		ssagen.NoWriteBarrierRecCheck()
 	}
 
-	// Finalize DWARF inline routine DIEs, then explicitly turn off
-	// DWARF inlining gen so as to avoid problems with generated
-	// method wrappers.
-	if base.Ctxt.DwFixups != nil {
-		base.Ctxt.DwFixups.Finalize(base.Ctxt.Pkgpath, base.Debug.DwarfInl != 0)
-		base.Ctxt.DwFixups = nil
-		base.Flag.GenDwarfInl = 0
+	// Add keep relocations for global maps.
+	if base.Debug.WrapGlobalMapCtl != 1 {
+		staticinit.AddKeepRelocations()
 	}
 
 	// Write object data to disk.

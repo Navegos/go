@@ -3,12 +3,11 @@
 // license that can be found in the LICENSE file.
 
 //go:build cgo && !netgo
-// +build cgo,!netgo
 
 package net
 
 /*
-#cgo LDFLAGS: -lsocket -lnsl -lsendfile
+#cgo LDFLAGS: -lsocket -lnsl
 #include <netdb.h>
 */
 import "C"

@@ -6,13 +6,13 @@ package typecheck
 
 import (
 	"fmt"
-	"sort"
-	"strconv"
+	"slices"
 	"strings"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/types"
+	"cmd/internal/obj"
 	"cmd/internal/src"
 )
 
@@ -20,47 +20,20 @@ func AssignConv(n ir.Node, t *types.Type, context string) ir.Node {
 	return assignconvfn(n, t, func() string { return context })
 }
 
-// DotImportRefs maps idents introduced by importDot back to the
-// ir.PkgName they were dot-imported through.
-var DotImportRefs map[*ir.Ident]*ir.PkgName
-
-// LookupNum looks up the symbol starting with prefix and ending with
-// the decimal n. If prefix is too long, LookupNum panics.
+// LookupNum returns types.LocalPkg.LookupNum(prefix, n).
 func LookupNum(prefix string, n int) *types.Sym {
-	var buf [20]byte // plenty long enough for all current users
-	copy(buf[:], prefix)
-	b := strconv.AppendInt(buf[:len(prefix)], int64(n), 10)
-	return types.LocalPkg.LookupBytes(b)
+	return types.LocalPkg.LookupNum(prefix, n)
 }
 
 // Given funarg struct list, return list of fn args.
-func NewFuncParams(tl *types.Type, mustname bool) []*ir.Field {
-	var args []*ir.Field
-	gen := 0
-	for _, t := range tl.Fields().Slice() {
-		s := t.Sym
-		if mustname && (s == nil || s.Name == "_") {
-			// invent a name so that we can refer to it in the trampoline
-			s = LookupNum(".anon", gen)
-			gen++
-		} else if s != nil && s.Pkg != types.LocalPkg {
-			// TODO(mdempsky): Preserve original position, name, and package.
-			s = Lookup(s.Name)
-		}
-		a := ir.NewField(base.Pos, s, nil, t.Type)
-		a.Pos = t.Pos
-		a.IsDDD = t.IsDDD()
-		args = append(args, a)
+func NewFuncParams(origs []*types.Field) []*types.Field {
+	res := make([]*types.Field, len(origs))
+	for i, orig := range origs {
+		p := types.NewField(orig.Pos, orig.Sym, orig.Type)
+		p.SetIsDDD(orig.IsDDD())
+		res[i] = p
 	}
-
-	return args
-}
-
-// newname returns a new ONAME Node associated with symbol s.
-func NewName(s *types.Sym) *ir.Name {
-	n := ir.NewNameAt(base.Pos, s)
-	n.Curfn = ir.CurFunc
-	return n
+	return res
 }
 
 // NodAddr returns a node representing &n at base.Pos.
@@ -68,68 +41,20 @@ func NodAddr(n ir.Node) *ir.AddrExpr {
 	return NodAddrAt(base.Pos, n)
 }
 
-// nodAddrPos returns a node representing &n at position pos.
+// NodAddrAt returns a node representing &n at position pos.
 func NodAddrAt(pos src.XPos, n ir.Node) *ir.AddrExpr {
-	n = markAddrOf(n)
-	return ir.NewAddrExpr(pos, n)
+	return ir.NewAddrExpr(pos, Expr(n))
 }
 
-func markAddrOf(n ir.Node) ir.Node {
-	if IncrementalAddrtaken {
-		// We can only do incremental addrtaken computation when it is ok
-		// to typecheck the argument of the OADDR. That's only safe after the
-		// main typecheck has completed.
-		// The argument to OADDR needs to be typechecked because &x[i] takes
-		// the address of x if x is an array, but not if x is a slice.
-		// Note: OuterValue doesn't work correctly until n is typechecked.
-		n = typecheck(n, ctxExpr)
-		if x := ir.OuterValue(n); x.Op() == ir.ONAME {
-			x.Name().SetAddrtaken(true)
-		}
-	} else {
-		// Remember that we built an OADDR without computing the Addrtaken bit for
-		// its argument. We'll do that later in bulk using computeAddrtaken.
-		DirtyAddrtaken = true
-	}
-	return n
-}
-
-// If IncrementalAddrtaken is false, we do not compute Addrtaken for an OADDR Node
-// when it is built. The Addrtaken bits are set in bulk by computeAddrtaken.
-// If IncrementalAddrtaken is true, then when an OADDR Node is built the Addrtaken
-// field of its argument is updated immediately.
-var IncrementalAddrtaken = false
-
-// If DirtyAddrtaken is true, then there are OADDR whose corresponding arguments
-// have not yet been marked as Addrtaken.
-var DirtyAddrtaken = false
-
-func ComputeAddrtaken(top []ir.Node) {
-	for _, n := range top {
-		var doVisit func(n ir.Node)
-		doVisit = func(n ir.Node) {
-			if n.Op() == ir.OADDR {
-				if x := ir.OuterValue(n.(*ir.AddrExpr).X); x.Op() == ir.ONAME {
-					x.Name().SetAddrtaken(true)
-					if x.Name().IsClosureVar() {
-						// Mark the original variable as Addrtaken so that capturevars
-						// knows not to pass it by value.
-						x.Name().Defn.Name().SetAddrtaken(true)
-					}
-				}
-			}
-			if n.Op() == ir.OCLOSURE {
-				ir.VisitList(n.(*ir.ClosureExpr).Func.Body, doVisit)
-			}
-		}
-		ir.Visit(n, doVisit)
-	}
+// LinksymAddr returns a new expression that evaluates to the address
+// of lsym. typ specifies the type of the addressed memory.
+func LinksymAddr(pos src.XPos, lsym *obj.LSym, typ *types.Type) *ir.AddrExpr {
+	n := ir.NewLinksymExpr(pos, lsym, typ)
+	return Expr(NodAddrAt(pos, n)).(*ir.AddrExpr)
 }
 
 func NodNil() ir.Node {
-	n := ir.NewNilExpr(base.Pos)
-	n.SetType(types.Types[types.TNIL])
-	return n
+	return ir.NewNilExpr(base.Pos, types.Types[types.TNIL])
 }
 
 // AddImplicitDots finds missing fields in obj.field that
@@ -137,9 +62,6 @@ func NodNil() ir.Node {
 // modifies the tree with missing field names.
 func AddImplicitDots(n *ir.SelectorExpr) *ir.SelectorExpr {
 	n.X = typecheck(n.X, ctxType|ctxExpr)
-	if n.X.Diag() {
-		n.SetDiag(true)
-	}
 	t := n.X.Type()
 	if t == nil {
 		return n
@@ -158,7 +80,7 @@ func AddImplicitDots(n *ir.SelectorExpr) *ir.SelectorExpr {
 	case path != nil:
 		// rebuild elided dots
 		for c := len(path) - 1; c >= 0; c-- {
-			dot := ir.NewSelectorExpr(base.Pos, ir.ODOT, n.X, path[c].field.Sym)
+			dot := ir.NewSelectorExpr(n.Pos(), ir.ODOT, n.X, path[c].field.Sym)
 			dot.SetImplicit(true)
 			dot.SetType(path[c].field.Type)
 			n.X = dot
@@ -171,14 +93,16 @@ func AddImplicitDots(n *ir.SelectorExpr) *ir.SelectorExpr {
 	return n
 }
 
+// CalcMethods calculates all the methods (including embedding) of a non-interface
+// type t.
 func CalcMethods(t *types.Type) {
-	if t == nil || t.AllMethods().Len() != 0 {
+	if t == nil || len(t.AllMethods()) != 0 {
 		return
 	}
 
 	// mark top-level method symbols
 	// so that expand1 doesn't consider them.
-	for _, f := range t.Methods().Slice() {
+	for _, f := range t.Methods() {
 		f.Sym.SetUniq(true)
 	}
 
@@ -215,12 +139,12 @@ func CalcMethods(t *types.Type) {
 		ms = append(ms, f)
 	}
 
-	for _, f := range t.Methods().Slice() {
+	for _, f := range t.Methods() {
 		f.Sym.SetUniq(false)
 	}
 
-	ms = append(ms, t.Methods().Slice()...)
-	sort.Sort(types.MethodsByName(ms))
+	ms = append(ms, t.Methods()...)
+	slices.SortFunc(ms, types.CompareFields)
 	t.SetAllMethods(ms)
 }
 
@@ -257,13 +181,13 @@ func adddot1(s *types.Sym, t *types.Type, d int, save **types.Field, ignorecase 
 		return c, false
 	}
 
-	var fields *types.Fields
+	var fields []*types.Field
 	if u.IsStruct() {
 		fields = u.Fields()
 	} else {
 		fields = u.AllMethods()
 	}
-	for _, f := range fields.Slice() {
+	for _, f := range fields {
 		if f.Embedded == 0 || f.Sym == nil {
 			continue
 		}
@@ -291,7 +215,7 @@ var dotlist = make([]dlist, 10)
 
 // Convert node n for assignment to type t.
 func assignconvfn(n ir.Node, t *types.Type, context func() string) ir.Node {
-	if n == nil || n.Type() == nil || n.Type().Broke() {
+	if n == nil || n.Type() == nil {
 		return n
 	}
 
@@ -301,29 +225,19 @@ func assignconvfn(n ir.Node, t *types.Type, context func() string) ir.Node {
 
 	n = convlit1(n, t, false, context)
 	if n.Type() == nil {
-		return n
+		base.Fatalf("cannot assign %v to %v", n, t)
+	}
+	if n.Type().IsUntyped() {
+		base.Fatalf("%L has untyped type", n)
 	}
 	if t.Kind() == types.TBLANK {
 		return n
 	}
-
-	// Convert ideal bool from comparison to plain bool
-	// if the next step is non-bool (like interface{}).
-	if n.Type() == types.UntypedBool && !t.IsBoolean() {
-		if n.Op() == ir.ONAME || n.Op() == ir.OLITERAL {
-			r := ir.NewConvExpr(base.Pos, ir.OCONVNOP, nil, n)
-			r.SetType(types.Types[types.TBOOL])
-			r.SetTypecheck(1)
-			r.SetImplicit(true)
-			n = r
-		}
-	}
-
 	if types.Identical(n.Type(), t) {
 		return n
 	}
 
-	op, why := Assignop(n.Type(), t)
+	op, why := assignOp(n.Type(), t)
 	if op == ir.OXXX {
 		base.Errorf("cannot use %L as type %v in %s%s", n, t, context(), why)
 		op = ir.OCONV
@@ -339,7 +253,7 @@ func assignconvfn(n ir.Node, t *types.Type, context func() string) ir.Node {
 // If so, return op code to use in conversion.
 // If not, return OXXX. In this case, the string return parameter may
 // hold a reason why. In all other cases, it'll be the empty string.
-func Assignop(src, dst *types.Type) (ir.Op, string) {
+func assignOp(src, dst *types.Type) (ir.Op, string) {
 	if src == dst {
 		return ir.OCONVNOP, ""
 	}
@@ -352,9 +266,10 @@ func Assignop(src, dst *types.Type) (ir.Op, string) {
 		return ir.OCONVNOP, ""
 	}
 
-	// 2. src and dst have identical underlying types
-	// and either src or dst is not a named type or
-	// both are empty interface types.
+	// 2. src and dst have identical underlying types and
+	//   a. either src or dst is not a named type, or
+	//   b. both are empty interface types, or
+	//   c. at least one is a gcshape type.
 	// For assignable but different non-empty interface types,
 	// we want to recompute the itab. Recomputing the itab ensures
 	// that itabs are unique (thus an interface with a compile-time
@@ -371,47 +286,32 @@ func Assignop(src, dst *types.Type) (ir.Op, string) {
 			// which need to have their itab updated.
 			return ir.OCONVNOP, ""
 		}
+		if src.IsShape() || dst.IsShape() {
+			// Conversion between a shape type and one of the types
+			// it represents also needs no conversion.
+			return ir.OCONVNOP, ""
+		}
 	}
 
 	// 3. dst is an interface type and src implements dst.
 	if dst.IsInterface() && src.Kind() != types.TNIL {
-		var missing, have *types.Field
-		var ptr int
-		if implements(src, dst, &missing, &have, &ptr) {
-			// Call NeedITab/ITabAddr so that (src, dst)
-			// gets added to itabs early, which allows
-			// us to de-virtualize calls through this
-			// type/interface pair later. See CompileITabs in reflect.go
-			if types.IsDirectIface(src) && !dst.IsEmptyInterface() {
-				NeedITab(src, dst)
-			}
-
+		if src.IsShape() {
+			// Shape types implement things they have already
+			// been typechecked to implement, even if they
+			// don't have the methods for them.
+			return ir.OCONVIFACE, ""
+		}
+		if src.HasShape() {
+			// Unified IR uses OCONVIFACE for converting all derived types
+			// to interface type, not just type arguments themselves.
 			return ir.OCONVIFACE, ""
 		}
 
-		// we'll have complained about this method anyway, suppress spurious messages.
-		if have != nil && have.Sym == missing.Sym && (have.Type.Broke() || missing.Type.Broke()) {
+		why := ImplementsExplain(src, dst)
+		if why == "" {
 			return ir.OCONVIFACE, ""
 		}
-
-		var why string
-		if isptrto(src, types.TINTER) {
-			why = fmt.Sprintf(":\n\t%v is pointer to interface, not interface", src)
-		} else if have != nil && have.Sym == missing.Sym && have.Nointerface() {
-			why = fmt.Sprintf(":\n\t%v does not implement %v (%v method is marked 'nointerface')", src, dst, missing.Sym)
-		} else if have != nil && have.Sym == missing.Sym {
-			why = fmt.Sprintf(":\n\t%v does not implement %v (wrong type for %v method)\n"+
-				"\t\thave %v%S\n\t\twant %v%S", src, dst, missing.Sym, have.Sym, have.Type, missing.Sym, missing.Type)
-		} else if ptr != 0 {
-			why = fmt.Sprintf(":\n\t%v does not implement %v (%v method has pointer receiver)", src, dst, missing.Sym)
-		} else if have != nil {
-			why = fmt.Sprintf(":\n\t%v does not implement %v (missing %v method)\n"+
-				"\t\thave %v%S\n\t\twant %v%S", src, dst, missing.Sym, have.Sym, have.Type, missing.Sym, missing.Type)
-		} else {
-			why = fmt.Sprintf(":\n\t%v does not implement %v (missing %v method)", src, dst, missing.Sym)
-		}
-
-		return ir.OXXX, why
+		return ir.OXXX, ":\n\t" + why
 	}
 
 	if isptrto(dst, types.TINTER) {
@@ -420,10 +320,8 @@ func Assignop(src, dst *types.Type) (ir.Op, string) {
 	}
 
 	if src.IsInterface() && dst.Kind() != types.TBLANK {
-		var missing, have *types.Field
-		var ptr int
 		var why string
-		if implements(dst, src, &missing, &have, &ptr) {
+		if Implements(dst, src) {
 			why = ": need type assertion"
 		}
 		return ir.OXXX, why
@@ -466,7 +364,7 @@ func Assignop(src, dst *types.Type) (ir.Op, string) {
 // If not, return OXXX. In this case, the string return parameter may
 // hold a reason why. In all other cases, it'll be the empty string.
 // srcConstant indicates whether the value of type src is a constant.
-func Convertop(srcConstant bool, src, dst *types.Type) (ir.Op, string) {
+func convertOp(srcConstant bool, src, dst *types.Type) (ir.Op, string) {
 	if src == dst {
 		return ir.OCONVNOP, ""
 	}
@@ -474,22 +372,22 @@ func Convertop(srcConstant bool, src, dst *types.Type) (ir.Op, string) {
 		return ir.OXXX, ""
 	}
 
-	// Conversions from regular to go:notinheap are not allowed
+	// Conversions from regular to not-in-heap are not allowed
 	// (unless it's unsafe.Pointer). These are runtime-specific
 	// rules.
-	// (a) Disallow (*T) to (*U) where T is go:notinheap but U isn't.
+	// (a) Disallow (*T) to (*U) where T is not-in-heap but U isn't.
 	if src.IsPtr() && dst.IsPtr() && dst.Elem().NotInHeap() && !src.Elem().NotInHeap() {
 		why := fmt.Sprintf(":\n\t%v is incomplete (or unallocatable), but %v is not", dst.Elem(), src.Elem())
 		return ir.OXXX, why
 	}
-	// (b) Disallow string to []T where T is go:notinheap.
+	// (b) Disallow string to []T where T is not-in-heap.
 	if src.IsString() && dst.IsSlice() && dst.Elem().NotInHeap() && (dst.Elem().Kind() == types.ByteType.Kind() || dst.Elem().Kind() == types.RuneType.Kind()) {
 		why := fmt.Sprintf(":\n\t%v is incomplete (or unallocatable)", dst.Elem())
 		return ir.OXXX, why
 	}
 
 	// 1. src can be assigned to dst.
-	op, why := Assignop(src, dst)
+	op, why := assignOp(src, dst)
 	if op != ir.OXXX {
 		return op, why
 	}
@@ -574,22 +472,16 @@ func Convertop(srcConstant bool, src, dst *types.Type) (ir.Op, string) {
 		return ir.OCONVNOP, ""
 	}
 
-	// 10. src is map and dst is a pointer to corresponding hmap.
-	// This rule is needed for the implementation detail that
-	// go gc maps are implemented as a pointer to a hmap struct.
-	if src.Kind() == types.TMAP && dst.IsPtr() &&
-		src.MapType().Hmap == dst.Elem() {
-		return ir.OCONVNOP, ""
-	}
-
-	// 11. src is a slice and dst is a pointer-to-array.
+	// 10. src is a slice and dst is an array or pointer-to-array.
 	// They must have same element type.
-	if src.IsSlice() && dst.IsPtr() && dst.Elem().IsArray() &&
-		types.Identical(src.Elem(), dst.Elem().Elem()) {
-		if !types.AllowsGoVersion(curpkg(), 1, 17) {
-			return ir.OXXX, ":\n\tconversion of slices to array pointers only supported as of -lang=go1.17"
+	if src.IsSlice() {
+		if dst.IsArray() && types.Identical(src.Elem(), dst.Elem()) {
+			return ir.OSLICE2ARR, ""
 		}
-		return ir.OSLICE2ARRPTR, ""
+		if dst.IsPtr() && dst.Elem().IsArray() &&
+			types.Identical(src.Elem(), dst.Elem().Elem()) {
+			return ir.OSLICE2ARRPTR, ""
+		}
 	}
 
 	return ir.OXXX, ""
@@ -635,7 +527,7 @@ func expand0(t *types.Type) {
 	}
 
 	if u.IsInterface() {
-		for _, f := range u.AllMethods().Slice() {
+		for _, f := range u.AllMethods() {
 			if f.Sym.Uniq() {
 				continue
 			}
@@ -648,7 +540,7 @@ func expand0(t *types.Type) {
 
 	u = types.ReceiverBaseType(t)
 	if u != nil {
-		for _, f := range u.Methods().Slice() {
+		for _, f := range u.Methods() {
 			if f.Sym.Uniq() {
 				continue
 			}
@@ -674,13 +566,13 @@ func expand1(t *types.Type, top bool) {
 	}
 
 	if u.IsStruct() || u.IsInterface() {
-		var fields *types.Fields
+		var fields []*types.Field
 		if u.IsStruct() {
 			fields = u.Fields()
 		} else {
 			fields = u.AllMethods()
 		}
-		for _, f := range fields.Slice() {
+		for _, f := range fields {
 			if f.Embedded == 0 {
 				continue
 			}
@@ -694,34 +586,63 @@ func expand1(t *types.Type, top bool) {
 	t.SetRecur(false)
 }
 
-func ifacelookdot(s *types.Sym, t *types.Type, ignorecase bool) (m *types.Field, followptr bool) {
+func ifacelookdot(s *types.Sym, t *types.Type, ignorecase bool) *types.Field {
 	if t == nil {
-		return nil, false
+		return nil
 	}
 
-	path, ambig := dotpath(s, t, &m, ignorecase)
+	var m *types.Field
+	path, _ := dotpath(s, t, &m, ignorecase)
 	if path == nil {
-		if ambig {
-			base.Errorf("%v.%v is ambiguous", t, s)
-		}
-		return nil, false
-	}
-
-	for _, d := range path {
-		if d.field.Type.IsPtr() {
-			followptr = true
-			break
-		}
+		return nil
 	}
 
 	if !m.IsMethod() {
-		base.Errorf("%v.%v is a field, not a method", t, s)
-		return nil, followptr
+		return nil
 	}
 
-	return m, followptr
+	return m
 }
 
+// Implements reports whether t implements the interface iface. t can be
+// an interface, a type parameter, or a concrete type.
+func Implements(t, iface *types.Type) bool {
+	var missing, have *types.Field
+	var ptr int
+	return implements(t, iface, &missing, &have, &ptr)
+}
+
+// ImplementsExplain reports whether t implements the interface iface. t can be
+// an interface, a type parameter, or a concrete type. If t does not implement
+// iface, a non-empty string is returned explaining why.
+func ImplementsExplain(t, iface *types.Type) string {
+	var missing, have *types.Field
+	var ptr int
+	if implements(t, iface, &missing, &have, &ptr) {
+		return ""
+	}
+
+	if isptrto(t, types.TINTER) {
+		return fmt.Sprintf("%v is pointer to interface, not interface", t)
+	} else if have != nil && have.Sym == missing.Sym && have.Nointerface() {
+		return fmt.Sprintf("%v does not implement %v (%v method is marked 'nointerface')", t, iface, missing.Sym)
+	} else if have != nil && have.Sym == missing.Sym {
+		return fmt.Sprintf("%v does not implement %v (wrong type for %v method)\n"+
+			"\t\thave %v%S\n\t\twant %v%S", t, iface, missing.Sym, have.Sym, have.Type, missing.Sym, missing.Type)
+	} else if ptr != 0 {
+		return fmt.Sprintf("%v does not implement %v (%v method has pointer receiver)", t, iface, missing.Sym)
+	} else if have != nil {
+		return fmt.Sprintf("%v does not implement %v (missing %v method)\n"+
+			"\t\thave %v%S\n\t\twant %v%S", t, iface, missing.Sym, have.Sym, have.Type, missing.Sym, missing.Type)
+	}
+	return fmt.Sprintf("%v does not implement %v (missing %v method)", t, iface, missing.Sym)
+}
+
+// implements reports whether t implements the interface iface. t can be
+// an interface, a type parameter, or a concrete type. If implements returns
+// false, it stores a method of iface that is not implemented in *m. If the
+// method name matches but the type is wrong, it additionally stores the type
+// of the method (on t) in *samename.
 func implements(t, iface *types.Type, m, samename **types.Field, ptr *int) bool {
 	t0 := t
 	if t == nil {
@@ -730,8 +651,8 @@ func implements(t, iface *types.Type, m, samename **types.Field, ptr *int) bool 
 
 	if t.IsInterface() {
 		i := 0
-		tms := t.AllMethods().Slice()
-		for _, im := range iface.AllMethods().Slice() {
+		tms := t.AllMethods()
+		for _, im := range iface.AllMethods() {
 			for i < len(tms) && tms[i].Sym != im.Sym {
 				i++
 			}
@@ -757,19 +678,16 @@ func implements(t, iface *types.Type, m, samename **types.Field, ptr *int) bool 
 	var tms []*types.Field
 	if t != nil {
 		CalcMethods(t)
-		tms = t.AllMethods().Slice()
+		tms = t.AllMethods()
 	}
 	i := 0
-	for _, im := range iface.AllMethods().Slice() {
-		if im.Broke() {
-			continue
-		}
+	for _, im := range iface.AllMethods() {
 		for i < len(tms) && tms[i].Sym != im.Sym {
 			i++
 		}
 		if i == len(tms) {
 			*m = im
-			*samename, _ = ifacelookdot(im.Sym, t, true)
+			*samename = ifacelookdot(im.Sym, t, true)
 			*ptr = 0
 			return false
 		}
@@ -780,12 +698,10 @@ func implements(t, iface *types.Type, m, samename **types.Field, ptr *int) bool 
 			*ptr = 0
 			return false
 		}
-		followptr := tm.Embedded == 2
 
 		// if pointer receiver in method,
 		// the method does not exist for value types.
-		rcvr := tm.Type.Recv().Type
-		if rcvr.IsPtr() && !t0.IsPtr() && !followptr && !types.IsInterfaceMethod(tm.Type) {
+		if !types.IsMethodApplicable(t0, tm) {
 			if false && base.Flag.LowerR != 0 {
 				base.Errorf("interface pointer mismatch")
 			}
@@ -828,13 +744,13 @@ func lookdot0(s *types.Sym, t *types.Type, save **types.Field, ignorecase bool) 
 
 	c := 0
 	if u.IsStruct() || u.IsInterface() {
-		var fields *types.Fields
+		var fields []*types.Field
 		if u.IsStruct() {
 			fields = u.Fields()
 		} else {
 			fields = u.AllMethods()
 		}
-		for _, f := range fields.Slice() {
+		for _, f := range fields {
 			if f.Sym == s || (ignorecase && f.IsMethod() && strings.EqualFold(f.Sym.Name, s.Name)) {
 				if save != nil {
 					*save = f
@@ -851,7 +767,7 @@ func lookdot0(s *types.Sym, t *types.Type, save **types.Field, ignorecase bool) 
 	}
 	u = types.ReceiverBaseType(u)
 	if u != nil {
-		for _, f := range u.Methods().Slice() {
+		for _, f := range u.Methods() {
 			if f.Embedded == 0 && (f.Sym == s || (ignorecase && strings.EqualFold(f.Sym.Name, s.Name))) {
 				if save != nil {
 					*save = f

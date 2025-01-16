@@ -45,6 +45,7 @@ func (s YCbCrSubsampleRatio) String() string {
 // that map to separate chroma samples.
 // It is not an absolute requirement, but YStride and len(Y) are typically
 // multiples of 8, and:
+//
 //	For 4:4:4, CStride == YStride/1 && len(Cb) == len(Cr) == len(Y)/1.
 //	For 4:2:2, CStride == YStride/2 && len(Cb) == len(Cr) == len(Y)/2.
 //	For 4:2:0, CStride == YStride/2 && len(Cb) == len(Cr) == len(Y)/4.
@@ -69,6 +70,11 @@ func (p *YCbCr) Bounds() Rectangle {
 
 func (p *YCbCr) At(x, y int) color.Color {
 	return p.YCbCrAt(x, y)
+}
+
+func (p *YCbCr) RGBA64At(x, y int) color.RGBA64 {
+	r, g, b, a := p.YCbCrAt(x, y).RGBA()
+	return color.RGBA64{uint16(r), uint16(g), uint16(b), uint16(a)}
 }
 
 func (p *YCbCr) YCbCrAt(x, y int) color.YCbCr {
@@ -210,6 +216,11 @@ func (p *NYCbCrA) At(x, y int) color.Color {
 	return p.NYCbCrAAt(x, y)
 }
 
+func (p *NYCbCrA) RGBA64At(x, y int) color.RGBA64 {
+	r, g, b, a := p.NYCbCrAAt(x, y).RGBA()
+	return color.RGBA64{uint16(r), uint16(g), uint16(b), uint16(a)}
+}
+
 func (p *NYCbCrA) NYCbCrAAt(x, y int) color.NYCbCrA {
 	if !(Point{X: x, Y: y}.In(p.Rect)) {
 		return color.NYCbCrA{}
@@ -283,7 +294,7 @@ func (p *NYCbCrA) Opaque() bool {
 	return true
 }
 
-// NewNYCbCrA returns a new NYCbCrA image with the given bounds and subsample
+// NewNYCbCrA returns a new [NYCbCrA] image with the given bounds and subsample
 // ratio.
 func NewNYCbCrA(r Rectangle, subsampleRatio YCbCrSubsampleRatio) *NYCbCrA {
 	w, h, cw, ch := yCbCrSize(r, subsampleRatio)

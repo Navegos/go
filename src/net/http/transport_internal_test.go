@@ -8,11 +8,12 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"io"
 	"net"
-	"net/http/internal"
+	"net/http/internal/testcert"
 	"strings"
 	"testing"
 )
@@ -36,7 +37,8 @@ func TestTransportPersistConnReadLoopEOF(t *testing.T) {
 	tr := new(Transport)
 	req, _ := NewRequest("GET", "http://"+ln.Addr().String(), nil)
 	req = req.WithT(t)
-	treq := &transportRequest{Request: req}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	treq := &transportRequest{Request: req, ctx: ctx, cancel: cancel}
 	cm := connectMethod{targetScheme: "http", targetAddr: ln.Addr().String()}
 	pc, err := tr.getConn(treq, cm)
 	if err != nil {
@@ -52,15 +54,20 @@ func TestTransportPersistConnReadLoopEOF(t *testing.T) {
 	conn.Close() // simulate the server hanging up on the client
 
 	_, err = pc.roundTrip(treq)
-	if !isTransportReadFromServerError(err) && err != errServerClosedIdle {
-		t.Errorf("roundTrip = %#v, %v; want errServerClosedIdle or transportReadFromServerError", err, err)
+	if !isNothingWrittenError(err) && !isTransportReadFromServerError(err) && err != errServerClosedIdle {
+		t.Errorf("roundTrip = %#v, %v; want errServerClosedIdle, transportReadFromServerError, or nothingWrittenError", err, err)
 	}
 
 	<-pc.closech
 	err = pc.closed
-	if !isTransportReadFromServerError(err) && err != errServerClosedIdle {
-		t.Errorf("pc.closed = %#v, %v; want errServerClosedIdle or transportReadFromServerError", err, err)
+	if !isNothingWrittenError(err) && !isTransportReadFromServerError(err) && err != errServerClosedIdle {
+		t.Errorf("pc.closed = %#v, %v; want errServerClosedIdle or transportReadFromServerError, or nothingWrittenError", err, err)
 	}
+}
+
+func isNothingWrittenError(err error) bool {
+	_, ok := err.(nothingWrittenError)
+	return ok
 }
 
 func isTransportReadFromServerError(err error) bool {
@@ -191,7 +198,7 @@ func (f roundTripFunc) RoundTrip(r *Request) (*Response, error) {
 
 // Issue 25009
 func TestTransportBodyAltRewind(t *testing.T) {
-	cert, err := tls.X509KeyPair(internal.LocalhostCert, internal.LocalhostKey)
+	cert, err := tls.X509KeyPair(testcert.LocalhostCert, testcert.LocalhostKey)
 	if err != nil {
 		t.Fatal(err)
 	}

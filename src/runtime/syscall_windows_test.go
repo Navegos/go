@@ -5,7 +5,6 @@
 package runtime_test
 
 import (
-	"bytes"
 	"fmt"
 	"internal/abi"
 	"internal/syscall/windows/sysdll"
@@ -266,11 +265,9 @@ func TestCallbackInAnotherThread(t *testing.T) {
 	h := syscall.Handle(r)
 	defer syscall.CloseHandle(h)
 
-	switch s, err := syscall.WaitForSingleObject(h, 100); s {
+	switch s, err := syscall.WaitForSingleObject(h, syscall.INFINITE); s {
 	case syscall.WAIT_OBJECT_0:
 		break
-	case syscall.WAIT_TIMEOUT:
-		t.Fatal("timeout waiting for thread to exit")
 	case syscall.WAIT_FAILED:
 		t.Fatalf("WaitForSingleObject failed: %v", err)
 	default:
@@ -288,7 +285,7 @@ func TestCallbackInAnotherThread(t *testing.T) {
 }
 
 type cbFunc struct {
-	goFunc interface{}
+	goFunc any
 }
 
 func (f cbFunc) cName(cdecl bool) string {
@@ -389,6 +386,10 @@ var cbFuncs = []cbFunc{
 	{func(i1, i2, i3, i4, i5 uint8Pair) uintptr {
 		return uintptr(i1.x + i1.y + i2.x + i2.y + i3.x + i3.y + i4.x + i4.y + i5.x + i5.y)
 	}},
+	{func(i1, i2, i3, i4, i5, i6, i7, i8, i9 uint32) uintptr {
+		runtime.GC()
+		return uintptr(i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9)
+	}},
 }
 
 //go:registerparams
@@ -461,6 +462,17 @@ func sum5andPair(i1, i2, i3, i4, i5 uint8Pair) uintptr {
 	return uintptr(i1.x + i1.y + i2.x + i2.y + i3.x + i3.y + i4.x + i4.y + i5.x + i5.y)
 }
 
+// This test forces a GC. The idea is to have enough arguments
+// that insufficient spill slots allocated (according to the ABI)
+// may cause compiler-generated spills to clobber the return PC.
+// Then, the GC stack scanning will catch that.
+//
+//go:registerparams
+func sum9andGC(i1, i2, i3, i4, i5, i6, i7, i8, i9 uint32) uintptr {
+	runtime.GC()
+	return uintptr(i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9)
+}
+
 // TODO(register args): Remove this once we switch to using the register
 // calling convention by default, since this is redundant with the existing
 // tests.
@@ -479,6 +491,7 @@ var cbFuncsRegABI = []cbFunc{
 	{sum9int8},
 	{sum5mix},
 	{sum5andPair},
+	{sum9andGC},
 }
 
 func getCallbackTestFuncs() []cbFunc {
@@ -613,6 +626,9 @@ func TestOutputDebugString(t *testing.T) {
 }
 
 func TestRaiseException(t *testing.T) {
+	if strings.HasPrefix(testenv.Builder(), "windows-amd64-2012") {
+		testenv.SkipFlaky(t, 49681)
+	}
 	o := runTestProg(t, "testprog", "RaiseException")
 	if strings.Contains(o, "RaiseException should not return") {
 		t.Fatalf("RaiseException did not crash program: %v", o)
@@ -630,21 +646,25 @@ func TestZeroDivisionException(t *testing.T) {
 }
 
 func TestWERDialogue(t *testing.T) {
-	if os.Getenv("TESTING_WER_DIALOGUE") == "1" {
-		defer os.Exit(0)
-
-		*runtime.TestingWER = true
+	if os.Getenv("TEST_WER_DIALOGUE") == "1" {
 		const EXCEPTION_NONCONTINUABLE = 1
 		mod := syscall.MustLoadDLL("kernel32.dll")
 		proc := mod.MustFindProc("RaiseException")
 		proc.Call(0xbad, EXCEPTION_NONCONTINUABLE, 0, 0)
-		println("RaiseException should not return")
-		return
+		t.Fatal("RaiseException should not return")
 	}
-	cmd := exec.Command(os.Args[0], "-test.run=TestWERDialogue")
-	cmd.Env = []string{"TESTING_WER_DIALOGUE=1"}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := testenv.CleanCmdEnv(testenv.Command(t, exe, "-test.run=TestWERDialogue"))
+	cmd.Env = append(cmd.Env, "TEST_WER_DIALOGUE=1", "GOTRACEBACK=wer")
 	// Child process should not open WER dialogue, but return immediately instead.
-	cmd.CombinedOutput()
+	// The exit code can't be reliably tested here because Windows can change it.
+	_, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Error("test program succeeded unexpectedly")
+	}
 }
 
 func TestWindowsStackMemory(t *testing.T) {
@@ -653,7 +673,7 @@ func TestWindowsStackMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read stack usage: %v", err)
 	}
-	if expected, got := 100<<10, stackUsage; got > expected {
+	if expected, got := 128<<10, stackUsage; got > expected {
 		t.Fatalf("expected < %d bytes of memory per thread, got %d", expected, got)
 	}
 }
@@ -744,7 +764,7 @@ uintptr_t cfunc(callback f, uintptr_t n) {
 	}
 }
 
-func TestSyscall18(t *testing.T) {
+func TestSyscallN(t *testing.T) {
 	if _, err := exec.LookPath("gcc"); err != nil {
 		t.Skip("skipping test: gcc is missing")
 	}
@@ -752,40 +772,52 @@ func TestSyscall18(t *testing.T) {
 		t.Skipf("skipping test: GOARCH=%s", runtime.GOARCH)
 	}
 
-	const src = `
-#include <stdint.h>
-#include <windows.h>
+	for arglen := 0; arglen <= runtime.MaxArgs; arglen++ {
+		arglen := arglen
+		t.Run(fmt.Sprintf("arg-%d", arglen), func(t *testing.T) {
+			t.Parallel()
+			args := make([]string, arglen)
+			rets := make([]string, arglen+1)
+			params := make([]uintptr, arglen)
+			for i := range args {
+				args[i] = fmt.Sprintf("int a%d", i)
+				rets[i] = fmt.Sprintf("(a%d == %d)", i, i)
+				params[i] = uintptr(i)
+			}
+			rets[arglen] = "1" // for arglen == 0
 
-int cfunc(	int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8, int a9,
-			int a10, int a11, int a12, int a13, int a14, int a15, int a16, int a17, int a18) {
-	return 1;
-}
-`
-	tmpdir := t.TempDir()
+			src := fmt.Sprintf(`
+		#include <stdint.h>
+		#include <windows.h>
+		int cfunc(%s) { return %s; }`, strings.Join(args, ", "), strings.Join(rets, " && "))
 
-	srcname := "mydll.c"
-	err := os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	outname := "mydll.dll"
-	cmd := exec.Command("gcc", "-shared", "-s", "-Werror", "-o", outname, srcname)
-	cmd.Dir = tmpdir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to build dll: %v - %v", err, string(out))
-	}
-	dllpath := filepath.Join(tmpdir, outname)
+			tmpdir := t.TempDir()
 
-	dll := syscall.MustLoadDLL(dllpath)
-	defer dll.Release()
+			srcname := "mydll.c"
+			err := os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			outname := "mydll.dll"
+			cmd := exec.Command("gcc", "-shared", "-s", "-Werror", "-o", outname, srcname)
+			cmd.Dir = tmpdir
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("failed to build dll: %v\n%s", err, out)
+			}
+			dllpath := filepath.Join(tmpdir, outname)
 
-	proc := dll.MustFindProc("cfunc")
+			dll := syscall.MustLoadDLL(dllpath)
+			defer dll.Release()
 
-	// proc.Call() will call Syscall18() internally.
-	r, _, err := proc.Call(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
-	if r != 1 {
-		t.Errorf("got %d want 1 (err=%v)", r, err)
+			proc := dll.MustFindProc("cfunc")
+
+			// proc.Call() will call SyscallN() internally.
+			r, _, err := proc.Call(params...)
+			if r != 1 {
+				t.Errorf("got %d want 1 (err=%v)", r, err)
+			}
+		})
 	}
 }
 
@@ -1013,7 +1045,7 @@ func TestNumCPU(t *testing.T) {
 
 	cmd := exec.Command(os.Args[0], "-test.run=TestNumCPU")
 	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
-	var buf bytes.Buffer
+	var buf strings.Builder
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: _CREATE_SUSPENDED}
@@ -1023,7 +1055,7 @@ func TestNumCPU(t *testing.T) {
 	}
 	defer func() {
 		err = cmd.Wait()
-		childOutput := string(buf.Bytes())
+		childOutput := buf.String()
 		if err != nil {
 			t.Fatalf("child failed: %v: %v", err, childOutput)
 		}
@@ -1079,12 +1111,6 @@ func TestDLLPreloadMitigation(t *testing.T) {
 
 	tmpdir := t.TempDir()
 
-	dir0, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chdir(dir0)
-
 	const src = `
 #include <stdint.h>
 #include <windows.h>
@@ -1095,7 +1121,7 @@ uintptr_t cfunc(void) {
 }
 `
 	srcname := "nojack.c"
-	err = os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
+	err := os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1116,7 +1142,7 @@ uintptr_t cfunc(void) {
 	// ("nojack.dll") Think of this as the user double-clicking an
 	// installer from their Downloads directory where a browser
 	// silently downloaded some malicious DLLs.
-	os.Chdir(tmpdir)
+	t.Chdir(tmpdir)
 
 	// First before we can load a DLL from the current directory,
 	// loading it only as "nojack.dll", without an absolute path.
@@ -1134,10 +1160,7 @@ uintptr_t cfunc(void) {
 	dll, err = syscall.LoadDLL(name)
 	if err == nil {
 		dll.Release()
-		if wantLoadLibraryEx() {
-			t.Fatalf("Bad: insecure load of DLL by base name %q before sysdll registration: %v", name, err)
-		}
-		t.Skip("insecure load of DLL, but expected")
+		t.Fatalf("Bad: insecure load of DLL by base name %q before sysdll registration: %v", name, err)
 	}
 }
 
@@ -1183,22 +1206,11 @@ func TestBigStackCallbackSyscall(t *testing.T) {
 	}
 }
 
-// wantLoadLibraryEx reports whether we expect LoadLibraryEx to work for tests.
-func wantLoadLibraryEx() bool {
-	return testenv.Builder() == "windows-amd64-gce" || testenv.Builder() == "windows-386-gce"
-}
-
-func TestLoadLibraryEx(t *testing.T) {
-	use, have, flags := runtime.LoadLibraryExStatus()
-	if use {
-		return // success.
-	}
-	if wantLoadLibraryEx() {
-		t.Fatalf("Expected LoadLibraryEx+flags to be available. (LoadLibraryEx=%v; flags=%v)",
-			have, flags)
-	}
-	t.Skipf("LoadLibraryEx not usable, but not expected. (LoadLibraryEx=%v; flags=%v)",
-		have, flags)
+func TestSyscallStackUsage(t *testing.T) {
+	// Test that the stack usage of a syscall doesn't exceed the limit.
+	// See https://go.dev/issue/69813.
+	syscall.Syscall15(procSetEvent.Addr(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	syscall.Syscall18(procSetEvent.Addr(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 }
 
 var (

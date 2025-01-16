@@ -91,7 +91,7 @@ func gentext(ctxt *ld.Link, ldr *loader.Loader) {
 }
 
 // Preserve highest 8 bits of a, and do addition to lower 24-bit
-// of a and b; used to adjust ARM branch instruction's target
+// of a and b; used to adjust ARM branch instruction's target.
 func braddoff(a int32, b int32) int32 {
 	return int32((uint32(a))&0xff000000 | 0x00ffffff&uint32(a+b))
 }
@@ -111,7 +111,7 @@ func adddynrel(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, s loade
 			return false
 		}
 
-		// Handle relocations found in ELF object files.
+	// Handle relocations found in ELF object files.
 	case objabi.ElfRelocOffset + objabi.RelocType(elf.R_ARM_PLT32):
 		su := ldr.MakeSymbolUpdater(s)
 		su.SetRelocType(rIdx, objabi.R_CALLARM)
@@ -224,7 +224,7 @@ func adddynrel(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, s loade
 		return true
 
 	case objabi.R_ADDR:
-		if ldr.SymType(s) != sym.SDATA {
+		if !ldr.SymType(s).IsDATA() {
 			break
 		}
 		if target.IsElf() {
@@ -237,6 +237,21 @@ func adddynrel(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, s loade
 			su.SetRelocSym(rIdx, 0)
 			return true
 		}
+
+	case objabi.R_GOTPCREL:
+		if target.IsExternal() {
+			// External linker will do this relocation.
+			return true
+		}
+		if targType != sym.SDYNIMPORT {
+			ldr.Errorf(s, "R_GOTPCREL target is not SDYNIMPORT symbol: %v", ldr.SymName(targ))
+		}
+		ld.AddGotSym(target, ldr, syms, targ, uint32(elf.R_ARM_GLOB_DAT))
+		su := ldr.MakeSymbolUpdater(s)
+		su.SetRelocType(rIdx, objabi.R_PCREL)
+		su.SetRelocSym(rIdx, syms.GOT)
+		su.SetRelocAdd(rIdx, r.Add()+int64(ldr.SymGot(targ)))
+		return true
 	}
 
 	return false
@@ -289,7 +304,7 @@ func elfreloc1(ctxt *ld.Link, out *ld.OutBuf, ldr *loader.Loader, s loader.Sym, 
 	return true
 }
 
-func elfsetupplt(ctxt *ld.Link, plt, got *loader.SymbolBuilder, dynamic loader.Sym) {
+func elfsetupplt(ctxt *ld.Link, ldr *loader.Loader, plt, got *loader.SymbolBuilder, dynamic loader.Sym) {
 	if plt.Size() == 0 {
 		// str lr, [sp, #-4]!
 		plt.AddUint32(ctxt.Arch, 0xe52de004)
@@ -341,6 +356,9 @@ func pereloc1(arch *sys.Arch, out *ld.OutBuf, ldr *loader.Loader, s loader.Sym, 
 
 	case objabi.R_ADDR:
 		v = ld.IMAGE_REL_ARM_ADDR32
+
+	case objabi.R_PEIMAGEOFF:
+		v = ld.IMAGE_REL_ARM_ADDR32NB
 	}
 
 	out.Write16(uint16(v))
@@ -348,7 +366,7 @@ func pereloc1(arch *sys.Arch, out *ld.OutBuf, ldr *loader.Loader, s loader.Sym, 
 	return true
 }
 
-// sign extend a 24-bit integer
+// sign extend a 24-bit integer.
 func signext24(x int64) int32 {
 	return (int32(x) << 8) >> 8
 }
@@ -364,22 +382,45 @@ func immrot(v uint32) uint32 {
 	return 0
 }
 
-// Convert the direct jump relocation r to refer to a trampoline if the target is too far
+// Convert the direct jump relocation r to refer to a trampoline if the target is too far.
 func trampoline(ctxt *ld.Link, ldr *loader.Loader, ri int, rs, s loader.Sym) {
 	relocs := ldr.Relocs(s)
 	r := relocs.At(ri)
 	switch r.Type() {
+	case objabi.ElfRelocOffset + objabi.RelocType(elf.R_ARM_CALL),
+		objabi.ElfRelocOffset + objabi.RelocType(elf.R_ARM_PC24),
+		objabi.ElfRelocOffset + objabi.RelocType(elf.R_ARM_JUMP24):
+		// Host object relocations that will be turned into a PLT call.
+		// The PLT may be too far. Insert a trampoline for them.
+		fallthrough
 	case objabi.R_CALLARM:
 		var t int64
 		// ldr.SymValue(rs) == 0 indicates a cross-package jump to a function that is not yet
 		// laid out. Conservatively use a trampoline. This should be rare, as we lay out packages
 		// in dependency order.
 		if ldr.SymValue(rs) != 0 {
-			// r.Add is the instruction
-			// low 24-bit encodes the target address
-			t = (ldr.SymValue(rs) + int64(signext24(r.Add()&0xffffff)*4) - (ldr.SymValue(s) + int64(r.Off()))) / 4
+			// Workaround for issue #58425: it appears that the
+			// external linker doesn't always take into account the
+			// relocation addend when doing reachability checks. This
+			// means that if you have a call from function XYZ at
+			// offset 8 to runtime.duffzero with addend 800 (for
+			// example), where the distance between the start of XYZ
+			// and the start of runtime.duffzero is just over the
+			// limit (by 100 bytes, say), you can get "relocation
+			// doesn't fit" errors from the external linker. To deal
+			// with this, ignore the addend when performing the
+			// distance calculation (this assumes that we're only
+			// handling backward jumps; ideally we might want to check
+			// both with and without the addend).
+			if ctxt.IsExternal() {
+				t = (ldr.SymValue(rs) - (ldr.SymValue(s) + int64(r.Off()))) / 4
+			} else {
+				// r.Add is the instruction
+				// low 24-bit encodes the target address
+				t = (ldr.SymValue(rs) + int64(signext24(r.Add()&0xffffff)*4) - (ldr.SymValue(s) + int64(r.Off()))) / 4
+			}
 		}
-		if t > 0x7fffff || t < -0x800000 || ldr.SymValue(rs) == 0 || (*ld.FlagDebugTramp > 1 && ldr.SymPkg(s) != ldr.SymPkg(rs)) {
+		if t > 0x7fffff || t <= -0x800000 || ldr.SymValue(rs) == 0 || (*ld.FlagDebugTramp > 1 && ldr.SymPkg(s) != ldr.SymPkg(rs)) {
 			// direct call too far, need to insert trampoline.
 			// look up existing trampolines first. if we found one within the range
 			// of direct call, we can reuse it. otherwise create a new one.
@@ -414,8 +455,8 @@ func trampoline(ctxt *ld.Link, ldr *loader.Loader, ri int, rs, s loader.Sym) {
 			if ldr.SymType(tramp) == 0 {
 				// trampoline does not exist, create one
 				trampb := ldr.MakeSymbolUpdater(tramp)
-				ctxt.AddTramp(trampb)
-				if ctxt.DynlinkingGo() {
+				ctxt.AddTramp(trampb, ldr.SymType(s))
+				if ctxt.DynlinkingGo() || ldr.SymType(rs) == sym.SDYNIMPORT {
 					if immrot(uint32(offset)) == 0 {
 						ctxt.Errorf(s, "odd offset in dynlink direct call: %v+%d", ldr.SymName(rs), offset)
 					}
@@ -438,7 +479,7 @@ func trampoline(ctxt *ld.Link, ldr *loader.Loader, ri int, rs, s loader.Sym) {
 	}
 }
 
-// generate a trampoline to target+offset
+// generate a trampoline to target+offset.
 func gentramp(arch *sys.Arch, linkmode ld.LinkMode, ldr *loader.Loader, tramp *loader.SymbolBuilder, target loader.Sym, offset int64) {
 	tramp.SetSize(12) // 3 instructions
 	P := make([]byte, tramp.Size())
@@ -460,7 +501,7 @@ func gentramp(arch *sys.Arch, linkmode ld.LinkMode, ldr *loader.Loader, tramp *l
 	}
 }
 
-// generate a trampoline to target+offset in position independent code
+// generate a trampoline to target+offset in position independent code.
 func gentramppic(arch *sys.Arch, tramp *loader.SymbolBuilder, target loader.Sym, offset int64) {
 	tramp.SetSize(16) // 4 instructions
 	P := make([]byte, tramp.Size())
@@ -481,7 +522,7 @@ func gentramppic(arch *sys.Arch, tramp *loader.SymbolBuilder, target loader.Sym,
 	r.SetAdd(offset + 4)
 }
 
-// generate a trampoline to target+offset in dynlink mode (using GOT)
+// generate a trampoline to target+offset in dynlink mode (using GOT).
 func gentrampdyn(arch *sys.Arch, tramp *loader.SymbolBuilder, target loader.Sym, offset int64) {
 	tramp.SetSize(20)                               // 5 instructions
 	o1 := uint32(0xe5900000 | 12<<12 | 15<<16 | 8)  // MOVW 8(R15), R12 // R15 is actual pc + 8
@@ -523,7 +564,6 @@ func gentrampdyn(arch *sys.Arch, tramp *loader.SymbolBuilder, target loader.Sym,
 
 func archreloc(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, r loader.Reloc, s loader.Sym, val int64) (o int64, nExtReloc int, ok bool) {
 	rs := r.Sym()
-	rs = ldr.ResolveABIAlias(rs)
 	if target.IsExternal() {
 		switch r.Type() {
 		case objabi.R_CALLARM:
@@ -571,7 +611,7 @@ func archrelocvariant(*ld.Target, *loader.Loader, loader.Reloc, sym.RelocVariant
 }
 
 func extreloc(target *ld.Target, ldr *loader.Loader, r loader.Reloc, s loader.Sym) (loader.ExtReloc, bool) {
-	rs := ldr.ResolveABIAlias(r.Sym())
+	rs := r.Sym()
 	var rr loader.ExtReloc
 	switch r.Type() {
 	case objabi.R_CALLARM:
